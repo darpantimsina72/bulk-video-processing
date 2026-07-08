@@ -1,0 +1,9 @@
+numpy
+matplotlib
+librosa
+sounddevice
+pydub
+google-genai
+google-cloud-texttospeech
+google-auth
+pyphen

@@ -1,0 +1,3 @@
+pip install numpy matplotlib librosa sounddevice pydub google-genai google-cloud-texttospeech pyphen spacy
+
+python -m spacy download en_core_web_sm

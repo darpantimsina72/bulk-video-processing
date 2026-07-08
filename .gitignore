@@ -1,0 +1,21 @@
+# Machine-specific — rebuilt by setup scripts
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Secrets & per-user settings — NEVER commit
+api.txt
+llm_settings.json
+TTS_Key.json
+vertex_key.json
+*.json.key
+
+# Runtime state
+last_language.txt
+error_log.txt
+_update_backup/
+logs/
+
+# Local tooling
+.claude/
