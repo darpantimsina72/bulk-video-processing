@@ -79,7 +79,30 @@ if errorlevel 1 (
 )
 
 REM ---------------------------------------------------------------
-REM 5) FFmpeg (needed for MP3 loading / audio export)
+REM 5) Verify the install actually works (catches half-installed
+REM    dependencies that would make the app close silently later)
+REM ---------------------------------------------------------------
+echo.
+echo Verifying installation...
+".venv\Scripts\python.exe" -c "import tkinter, numpy, matplotlib, librosa, sounddevice, pydub, pyphen; from google import genai; from google.cloud import texttospeech"
+if errorlevel 1 (
+    echo.
+    echo ============================================================
+    echo  VERIFICATION FAILED - the app will not start yet.
+    echo  One or more libraries did not install correctly ^(details
+    echo  above^). Common causes:
+    echo    - Internet dropped during install: re-run this script
+    echo    - Very new Python version without prebuilt packages:
+    echo      install Python 3.12 or 3.13 from python.org, delete
+    echo      the .venv folder here, and re-run this script
+    echo ============================================================
+    pause
+    exit /b 1
+)
+echo All libraries verified - OK.
+
+REM ---------------------------------------------------------------
+REM 6) FFmpeg (needed for MP3 loading / audio export)
 REM ---------------------------------------------------------------
 where ffmpeg >nul 2>nul
 if errorlevel 1 (

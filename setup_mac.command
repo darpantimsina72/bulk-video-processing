@@ -73,7 +73,25 @@ echo "Installing dependencies (this can take a few minutes)..."
 }
 
 # ---------------------------------------------------------------
-# 4) FFmpeg (needed for MP3 loading / audio export)
+# 4) Verify the install actually works (catches half-installed
+#    dependencies that would make the app close silently later)
+# ---------------------------------------------------------------
+echo
+echo "Verifying installation..."
+if ! .venv/bin/python -c 'import tkinter, numpy, matplotlib, librosa, sounddevice, pydub, pyphen; from google import genai; from google.cloud import texttospeech'; then
+    echo
+    echo "============================================================"
+    echo " VERIFICATION FAILED — the app will not start yet."
+    echo " One or more libraries did not install correctly (details"
+    echo " above). Usually fixed by re-running this script."
+    echo "============================================================"
+    read -p "Press Enter to close..."
+    exit 1
+fi
+echo "All libraries verified — OK."
+
+# ---------------------------------------------------------------
+# 5) FFmpeg (needed for MP3 loading / audio export)
 # ---------------------------------------------------------------
 if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/ffmpeg ] && [ ! -x /usr/local/bin/ffmpeg ]; then
     if command -v brew >/dev/null 2>&1; then

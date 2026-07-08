@@ -79,19 +79,36 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
+def _fatal_import_error(lib_name: str, detail: str):
+    """A required library failed to import. Print + log + dialog, then exit
+    with a NON-ZERO code so the launcher scripts keep the console open."""
+    msg = (f"Required library '{lib_name}' failed to load:\n\n{detail}\n\n"
+           f"Fix: run the setup script again "
+           f"(setup_windows.bat on Windows, setup_mac.command on macOS).")
+    print(msg, file=sys.stderr)
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "error_log.txt"), "a", encoding="utf-8") as f:
+            f.write(f"\n[startup] {msg}\n")
+    except OSError:
+        pass
+    try:
+        import tkinter.messagebox as _mb
+        _mb.showerror("Missing Library", msg)
+    except Exception:
+        pass
+    raise SystemExit(1)
+
+
 try:
     import librosa
-except ImportError:
-    import tkinter.messagebox as _mb
-    _mb.showerror("Missing Library", "pip install librosa")
-    raise SystemExit
+except Exception as _e:          # numba/llvmlite breakage isn't ImportError
+    _fatal_import_error("librosa", repr(_e))
 
 try:
     import sounddevice as sd
-except ImportError:
-    import tkinter.messagebox as _mb
-    _mb.showerror("Missing Library", "pip install sounddevice")
-    raise SystemExit
+except Exception as _e:
+    _fatal_import_error("sounddevice", repr(_e))
 
 try:
     from pydub import AudioSegment as _AudioSegment
@@ -123,7 +140,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.0.0"
+APP_VERSION  = "1.0.1"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -210,7 +227,7 @@ _UPDATE_PROTECTED = {
     ".git", ".venv", "__pycache__", "_update_backup",
     "api.txt", "llm_settings.json", "last_language.txt",
     "TTS_Key.json", "vertex_key.json", "error_log.txt",
-    "github_token.txt",
+    "github_token.txt", "launch_log.txt",
 }
 
 
