@@ -210,11 +210,30 @@ _UPDATE_PROTECTED = {
     ".git", ".venv", "__pycache__", "_update_backup",
     "api.txt", "llm_settings.json", "last_language.txt",
     "TTS_Key.json", "vertex_key.json", "error_log.txt",
+    "github_token.txt",
 }
 
 
-def _fetch_url(url: str, timeout: int = 30) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "TranslationSyncApp-Updater"})
+def _github_token() -> str:
+    """Optional: a GitHub personal-access token in github_token.txt next to
+    the app enables updates from a PRIVATE repository. Not needed when the
+    repo is public. The file is gitignored and never uploaded."""
+    p = os.path.join(SCRIPT_DIR, "github_token.txt")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _fetch_url(url: str, timeout: int = 30, headers: Optional[dict] = None) -> bytes:
+    h = {"User-Agent": "TranslationSyncApp-Updater"}
+    if headers:
+        h.update(headers)
+    tok = _github_token()
+    if tok and "github" in url:
+        h["Authorization"] = f"token {tok}"
+    req = urllib.request.Request(url, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
@@ -233,8 +252,10 @@ def _version_tuple(v: str) -> tuple:
 
 def fetch_remote_version() -> str:
     """Read the VERSION file from the GitHub repo's main branch."""
-    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/VERSION"
-    return _fetch_url(url).decode("utf-8").strip()
+    # The API endpoint works for both public and (with token) private repos.
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/VERSION?ref=main"
+    return _fetch_url(url, headers={"Accept": "application/vnd.github.raw"}
+                      ).decode("utf-8").strip()
 
 
 def download_and_apply_update() -> str:
@@ -243,7 +264,8 @@ def download_and_apply_update() -> str:
     that gets replaced is first copied into _update_backup/<timestamp>/.
     Returns the backup folder path."""
     import zipfile, tempfile, datetime
-    blob = _fetch_url(f"https://github.com/{GITHUB_REPO}/archive/refs/heads/main.zip",
+    # API zipball works for both public and (with token) private repos.
+    blob = _fetch_url(f"https://api.github.com/repos/{GITHUB_REPO}/zipball/main",
                       timeout=300)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = os.path.join(SCRIPT_DIR, "_update_backup", stamp)

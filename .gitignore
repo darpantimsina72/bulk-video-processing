@@ -19,3 +19,4 @@ logs/
 
 # Local tooling
 .claude/
+github_token.txt
