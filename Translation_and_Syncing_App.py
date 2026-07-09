@@ -140,7 +140,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.0.1"
+APP_VERSION  = "1.1.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -355,6 +355,78 @@ def _prepare_output_dir(audio_path: str) -> str:
     return out_dir
 
 
+# ─── Run history (History tab / re-dub) ──────────────────────────────────────
+RUN_HISTORY_FILE  = os.path.join(SCRIPT_DIR, "run_history.json")
+_RUN_HISTORY_LOCK = threading.Lock()
+
+
+def _history_load() -> List[dict]:
+    """Return run-history entries, newest first. Never raises."""
+    try:
+        with open(RUN_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("runs", []) if isinstance(data, dict) else []
+        entries = [e for e in entries if isinstance(e, dict) and e.get("base")]
+        entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
+        return entries
+    except Exception:
+        return []
+
+
+def _history_save(entries: List[dict]) -> None:
+    with open(RUN_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"runs": entries}, f, ensure_ascii=False, indent=2)
+
+
+def _history_record(audio_path: str, outdir: str, base: str,
+                    language: str, source: str) -> None:
+    """Insert/refresh a run entry, keyed by (base, language). Never raises —
+    history is best-effort and must not break a pipeline run."""
+    try:
+        with _RUN_HISTORY_LOCK:
+            entries = _history_load()
+            key = (os.path.abspath(base), language)
+            entries = [e for e in entries
+                       if (os.path.abspath(e.get("base", "")),
+                           e.get("language")) != key]
+            entries.insert(0, {
+                "ts":         time.strftime("%Y-%m-%d %H:%M:%S"),
+                "language":   language,
+                "audio_path": os.path.abspath(audio_path),
+                "outdir":     os.path.abspath(outdir),
+                "base":       os.path.abspath(base),
+                "source":     source,
+            })
+            _history_save(entries)
+    except Exception:
+        pass
+
+
+def _history_remove(base: str, language: str) -> None:
+    """Drop one entry from the run history. Never raises."""
+    try:
+        with _RUN_HISTORY_LOCK:
+            key = (os.path.abspath(base), language)
+            entries = [e for e in _history_load()
+                       if (os.path.abspath(e.get("base", "")),
+                           e.get("language")) != key]
+            _history_save(entries)
+    except Exception:
+        pass
+
+
+def _history_next_redub_rev(outdir: str) -> int:
+    """Next free re-dub revision number for *outdir* (2, 3, …)."""
+    n = 2
+    try:
+        names = os.listdir(outdir)
+    except Exception:
+        names = []
+    while any(f"_redub{n:02d}" in name for name in names):
+        n += 1
+    return n
+
+
 # ─── TTS Language / Voice catalogue ─────────────────────────────────────────
 # Single source of truth for every per-language artefact: BCP-47 locale code,
 # native autonym, ElevenLabs language-token filter, and Google Cloud TTS voice
@@ -480,8 +552,9 @@ def _tts_output_name(language: str, audio_path: str, suffix: str = "_tts") -> st
     return f"{display}_({audio_base}){suffix}.wav"
 
 def _strip_emotion_tags(text: str) -> str:
-    """Strip ElevenLabs inline emotion/accent tags like [calm], [bengali accent], [pause]."""
-    return re.sub(r'\[[\w\s]+\]', '', text).strip()
+    """Strip ElevenLabs inline emotion/accent tags like [calm],
+    [bengali accent], [pause] — including closers like [/fast]."""
+    return re.sub(r'\[/?[\w\s]+\]', '', text).strip()
 TTS_DEFAULT_ENGINE   = "Chirp3"
 TTS_DEFAULT_VOICE    = "bn-IN-Chirp3-HD-Aoede"
 
@@ -493,6 +566,15 @@ ELEVENLABS_TTS_VOICE_ID = ""
 # inclusive). It does not accept a language_code parameter — sending one
 # triggers HTTP 400 unsupported_language errors on multilingual models.
 ELEVENLABS_TTS_MODEL    = "eleven_v3"
+# Selectable ElevenLabs TTS models — all multilingual / Indic-capable.
+# Only eleven_v3 understands inline audio tags ([calm], [pause], …); for the
+# other models synthesize_tts_elevenlabs strips the tags before sending.
+ELEVENLABS_TTS_MODELS   = {
+    "eleven_v3":              "v3 — expressive (audio tags)",
+    "eleven_multilingual_v2": "Multilingual v2 — stable",
+    "eleven_turbo_v2_5":      "Turbo v2.5 — fast",
+    "eleven_flash_v2_5":      "Flash v2.5 — fastest",
+}
 TTS_PLATFORMS           = ["ElevenLabs", "Google TTS"]
 TTS_DEFAULT_PLATFORM    = "ElevenLabs"
 
@@ -549,6 +631,29 @@ def _write_last_language(language: str) -> None:
     except Exception:
         pass
 
+def _read_el_model() -> str:
+    """Restore the user's ElevenLabs model choice across sessions."""
+    try:
+        p = os.path.join(SCRIPT_DIR, "el_model.txt")
+        if not os.path.exists(p):
+            return ELEVENLABS_TTS_MODEL
+        with open(p, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        return v if v in ELEVENLABS_TTS_MODELS else ELEVENLABS_TTS_MODEL
+    except Exception:
+        return ELEVENLABS_TTS_MODEL
+
+def _write_el_model(model_id: str) -> None:
+    """Persist the ElevenLabs model choice. Best-effort, never crashes."""
+    if model_id not in ELEVENLABS_TTS_MODELS:
+        return
+    try:
+        p = os.path.join(SCRIPT_DIR, "el_model.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(model_id)
+    except Exception:
+        pass
+
 # Characters per ElevenLabs TTS request chunk
 ELEVENLABS_CHUNK_CHARS = 1000
 
@@ -593,6 +698,7 @@ THR_LINE     = "#f87171"   # threshold line (red-400)
 CURSOR_C     = "#4ade80"   # playback cursor (green-400)
 CURSOR_W     = 1.5
 TR_ACCENT    = "#22c55e"   # success/accent green
+PLAY_COL_W   = 40          # px — ▶ button column in the review window
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif", ".m4a"}
 
@@ -1857,6 +1963,84 @@ def _strip_code_fence(text: str) -> str:
     return m.group(1) if m else text
 
 
+def _extract_srt_entries(srt_text: str) -> List[Tuple[float, float, str]]:
+    """Return (start_sec, end_sec, text) for every SRT block, in order."""
+    if not srt_text:
+        return []
+    pattern = re.compile(
+        r'\d+\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n([\s\S]*?)(?=\n\n|\n$|$)',
+        re.MULTILINE)
+
+    def _to_sec(ts):
+        h, m, s_ms = ts.split(':')
+        s, ms = s_ms.split(',')
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    return [(_to_sec(m.group(1)), _to_sec(m.group(2)),
+             m.group(3).replace('\n', ' ').strip())
+            for m in pattern.finditer(srt_text)]
+
+
+def _split_translation_paragraphs(text: str) -> List[str]:
+    """Split a dubbing script into its blank-line-separated paragraphs.
+
+    The translation prompts make the LLM emit roughly one paragraph per
+    English subtitle segment, so these rows pair up with
+    _extract_srt_texts() in the manual-review window."""
+    text = _strip_code_fence(text or "").strip()
+    return [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+
+
+def _pair_review_rows(en_entries: List[Tuple[float, float, str]],
+                      tr_paragraphs: List[str]
+                      ) -> List[Tuple[str, str, Optional[float], Optional[float]]]:
+    """Pair English SRT segments with translation paragraphs for review.
+
+    Counts rarely match 1:1 — the punctuation pass merges several spoken
+    pulses into one continuous paragraph — so when there are more English
+    segments than paragraphs, consecutive segments are grouped onto each
+    paragraph proportionally by character share. Returns ordered
+    (english_text, translation_text, start_sec, end_sec) rows; the times
+    span the grouped English segments (None when a row has no English)."""
+    en = [(s0, s1, t.strip()) for (s0, s1, t) in en_entries if t and t.strip()]
+    tr = [p.strip() for p in tr_paragraphs if p and p.strip()]
+    if not tr:
+        return [(t, "", s0, s1) for (s0, s1, t) in en]
+    if not en:
+        return [("", p, None, None) for p in tr]
+    if len(en) <= len(tr):
+        return [(en[i][2], p, en[i][0], en[i][1]) if i < len(en)
+                else ("", p, None, None)
+                for i, p in enumerate(tr)]
+
+    tr_total = float(sum(len(p) for p in tr)) or 1.0
+    en_total = float(sum(len(t) for (_, _, t) in en)) or 1.0
+    prefix = [0.0]                            # prefix[j] = chars in en[:j]
+    for (_, _, t) in en:
+        prefix.append(prefix[-1] + len(t))
+
+    rows, i, acc = [], 0, 0.0
+    for k, p in enumerate(tr):
+        if k == len(tr) - 1:
+            j = len(en)                       # last paragraph takes the rest
+        else:
+            acc += len(p)
+            target = acc / tr_total * en_total
+            # ≥1 segment per row, and leave ≥1 for every remaining paragraph
+            j_min = i + 1
+            j_max = len(en) - (len(tr) - 1 - k)
+            j = j_min
+            while j < j_max and prefix[j] < target:
+                j += 1
+            # step back if the previous boundary is closer to the target
+            if j > j_min and (prefix[j] - target) > (target - prefix[j - 1]):
+                j -= 1
+        rows.append((" ".join(t for (_, _, t) in en[i:j]), p,
+                     en[i][0], en[j - 1][1]))
+        i = j
+    return rows
+
+
 def _run_emotion_enrichment(text: str,
                             language: str = TTS_DEFAULT_LANGUAGE,
                             model: str = GEMINI_DEFAULT_MODEL,
@@ -2257,6 +2441,14 @@ def synthesize_tts_elevenlabs(text: str, output_path: str, api_key: str,
             f"(received: {raw_voice_id!r}). Re-select a voice from the "
             "dropdown — the value must be the raw voice ID, not a display label.")
     model_id = (model_id or ELEVENLABS_TTS_MODEL).strip() or ELEVENLABS_TTS_MODEL
+
+    # Inline audio tags ([calm], [pause], [fast]…) are an eleven_v3 feature.
+    # Older models (multilingual v2, turbo/flash v2.5) would read them aloud,
+    # so strip them from the script for anything that isn't v3.
+    if not model_id.startswith("eleven_v3"):
+        stripped = _strip_emotion_tags(text)
+        if stripped.strip():
+            text = stripped
 
     if status_cb:
         status_cb("TTS: Connecting to ElevenLabs…")
@@ -3125,6 +3317,8 @@ class EndToEndApp:
         self._tts_google_frame    = None   # sub-frame shown only when Google TTS selected
         self._tts_el_frame        = None   # sub-frame shown only when ElevenLabs selected
         self._el_voice_var        = None   # StringVar — selected Bengali voice (label)
+        self._el_model_var        = None   # StringVar — ElevenLabs model id (raw)
+        self._el_model_cb_widgets = []     # [(combobox, display StringVar), …]
         # Legacy var kept None — Bengali voice IDs are auto-loaded; manual
         # override has been removed per the simplified Bengali workflow.
         self._el_custom_voice_var = None
@@ -3164,6 +3358,12 @@ class EndToEndApp:
 
         # Emotion enrichment toggle (Step 4)
         self._emotion_enabled_var = tk.BooleanVar(value=True)
+
+        # Manual review of the translation before dubbing (single-file
+        # pipeline only). When on, the pipeline pauses after translation
+        # and shows a side-by-side English/translation review window with
+        # Skip / Continue buttons.
+        self._review_enabled_var = tk.BooleanVar(value=True)
 
         # ── Audio Syncing tab state ──────────────────────────────────────────
         # Two independent waveform panels (English + Bengali). Each "side"
@@ -3289,15 +3489,18 @@ class EndToEndApp:
         self.batch_tab = tk.Frame(self.notebook, bg=BG)
         self.tts_tab   = tk.Frame(self.notebook, bg=BG)
         self.sync_tab  = tk.Frame(self.notebook, bg=BG)
+        self.hist_tab  = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.main_tab,  text="  Single File  ")
         self.notebook.add(self.batch_tab, text="  Batch Process  ")
         self.notebook.add(self.tts_tab,   text="  TTS  ")
         self.notebook.add(self.sync_tab,  text="  Audio Syncing  ")
+        self.notebook.add(self.hist_tab,  text="  History  ")
 
         self._build_main_tab()
         self._build_batch_tab()
         self._build_tts_tab()
         self._build_audio_sync_tab()
+        self._build_history_tab()
 
     # ── Single File Tab ───────────────────────────────────────────────────────
     def _build_main_tab(self):
@@ -3551,9 +3754,10 @@ class EndToEndApp:
         platform_cb.pack(side="left", padx=(0, 8))
         platform_cb.bind("<<ComboboxSelected>>", self._on_tts_platform_change)
 
-        # ElevenLabs sub-frame — empty placeholder for visibility toggling
+        # ElevenLabs sub-frame — holds the ElevenLabs model picker
         ef = tk.Frame(prow, bg=_card_bg)
         self._tts_el_frame = ef
+        self._build_el_model_picker(ef, _card_bg)
 
         # Google-TTS-only sub-frame (Engine + Voice)
         gf = tk.Frame(prow, bg=_card_bg)
@@ -4067,6 +4271,50 @@ class EndToEndApp:
     def _on_tts_platform_change(self, _event=None):
         self._apply_tts_platform_visibility()
 
+    def _build_el_model_picker(self, parent, panel_bg):
+        """ElevenLabs model selector (v3 / multilingual v2 / turbo / flash).
+
+        Rendered inside the ElevenLabs platform sub-frame so it shows and
+        hides with the platform toggle. Every surface shares
+        self._el_model_var (raw model id); each combobox keeps its own
+        display var, kept in sync across mirrors on selection."""
+        if self._el_model_var is None:
+            self._el_model_var = tk.StringVar(value=_read_el_model())
+
+        tk.Frame(parent, bg="#5b4fbf", width=1, height=20).pack(
+            side="left", padx=(0, 10), pady=2)
+        tk.Label(parent, text="Model:", bg=panel_bg, fg=TEXT_MUTED,
+                 font=(UI_FONT, 9)).pack(side="left", padx=(0, 4))
+
+        disp = tk.StringVar(value=ELEVENLABS_TTS_MODELS.get(
+            self._el_model_var.get(), self._el_model_var.get()))
+        cb = ttk.Combobox(parent, textvariable=disp, state="readonly",
+                          width=26, font=(UI_FONT, 9),
+                          values=list(ELEVENLABS_TTS_MODELS.values()))
+        cb.pack(side="left", padx=(0, 8))
+
+        def _picked(_event=None):
+            label = disp.get()
+            for mid, lbl in ELEVENLABS_TTS_MODELS.items():
+                if lbl == label:
+                    self._el_model_var.set(mid)
+                    _write_el_model(mid)
+                    break
+            for _cb, ovar in self._el_model_cb_widgets:
+                if ovar is not disp:
+                    ovar.set(label)
+
+        cb.bind("<<ComboboxSelected>>", _picked)
+        self._el_model_cb_widgets.append((cb, disp))
+
+    def _get_el_model(self) -> str:
+        """Raw ElevenLabs model id currently selected (falls back to default)."""
+        try:
+            v = (self._el_model_var.get() if self._el_model_var else "").strip()
+        except Exception:
+            v = ""
+        return v if v in ELEVENLABS_TTS_MODELS else ELEVENLABS_TTS_MODEL
+
     def _apply_tts_platform_visibility(self):
         """Show the correct platform sub-frame; hide the other (both panels)."""
         platform = self._tts_platform_var.get() if self._tts_platform_var else TTS_DEFAULT_PLATFORM
@@ -4182,9 +4430,10 @@ class EndToEndApp:
                 self._tts_voice_var.set(voices[0])
 
     def _get_tts_params(self):
-        """Return (platform, lang_code, voice_name, el_voice_id, language) from
-        the TTS settings panel. el_voice_id is resolved from the auto-loaded
-        ElevenLabs voice dropdown."""
+        """Return (platform, lang_code, voice_name, el_voice_id, language,
+        el_model) from the TTS settings panel. el_voice_id is resolved from
+        the auto-loaded ElevenLabs voice dropdown; el_model is the raw
+        ElevenLabs model id from the Model picker."""
         platform  = self._tts_platform_var.get() if self._tts_platform_var else TTS_DEFAULT_PLATFORM
         lang      = self._tts_language_var.get() if self._tts_language_var else TTS_DEFAULT_LANGUAGE
         if lang not in TTS_LANGUAGES:
@@ -4192,7 +4441,7 @@ class EndToEndApp:
         voice     = self._tts_voice_var.get()    if self._tts_voice_var    else TTS_DEFAULT_VOICE
         lang_code = TTS_LANGUAGES.get(lang, {}).get("code", "bn-IN")
         el_voice_id = self._resolve_el_voice_id()
-        return platform, lang_code, voice, el_voice_id, lang
+        return platform, lang_code, voice, el_voice_id, lang, self._get_el_model()
 
     def _get_en_region_params(self):
         """Return (thr_db, hys_db, min_ms) for English audio region detection."""
@@ -4391,24 +4640,40 @@ class EndToEndApp:
                   cursor="hand2", relief="flat", padx=8,
                   ).pack(side="left", padx=(6, 0), pady=4)
 
-        tk.Checkbutton(
-            model_row, text="Emotion Enhancement",
-            variable=self._emotion_enabled_var,
-            bg=PANEL3, fg=TEXT, selectcolor=PANEL,
-            activebackground=PANEL3, activeforeground=ACCENT,
-            font=(MONO_FONT, 9),
-        ).pack(side="left", padx=(20, 0), pady=6)
+        # ── Options row (own row so nothing clips off the right edge) ─────────
+        opts_row = tk.Frame(tp, bg=PANEL3, height=34)
+        opts_row.pack(fill="x")
+        opts_row.pack_propagate(False)
 
         # Prompt-chain depth: how many LLM passes the translation makes
-        tk.Label(model_row, text="Prompt steps:", bg=PANEL3, fg=TEXT_FAINT,
-                 font=(MONO_FONT, 9)).pack(side="left", padx=(20, 4), pady=6)
+        tk.Label(opts_row, text="Prompt steps:", bg=PANEL3, fg=TEXT_FAINT,
+                 font=(MONO_FONT, 9, "bold")).pack(side="left", padx=(14, 4), pady=6)
         for n, tip in ((1, "1 (translate)"), (2, "2 (+review)"), (3, "3 (+punctuation)")):
             tk.Radiobutton(
-                model_row, text=tip, variable=self._translation_steps_var, value=n,
+                opts_row, text=tip, variable=self._translation_steps_var, value=n,
                 bg=PANEL3, fg=TEXT, selectcolor=PANEL,
                 activebackground=PANEL3, activeforeground=ACCENT,
                 font=(MONO_FONT, 9), cursor="hand2",
             ).pack(side="left", padx=(0, 6), pady=6)
+
+        tk.Frame(opts_row, bg=PANEL_BORDER, width=2, height=20).pack(
+            side="left", padx=(8, 12), pady=7)
+
+        tk.Checkbutton(
+            opts_row, text="Emotion Enhancement",
+            variable=self._emotion_enabled_var,
+            bg=PANEL3, fg=TEXT, selectcolor=PANEL,
+            activebackground=PANEL3, activeforeground=ACCENT,
+            font=(MONO_FONT, 9),
+        ).pack(side="left", padx=(0, 12), pady=6)
+
+        tk.Checkbutton(
+            opts_row, text="Review before dubbing",
+            variable=self._review_enabled_var,
+            bg=PANEL3, fg=TEXT, selectcolor=PANEL,
+            activebackground=PANEL3, activeforeground=ACCENT,
+            font=(MONO_FONT, 9), cursor="hand2",
+        ).pack(side="left", padx=(0, 6), pady=6)
 
     # ── LLM provider settings dialog ─────────────────────────────────────────
 
@@ -4980,9 +5245,10 @@ class EndToEndApp:
         platform_cb.pack(side="left", padx=(0, 8))
         platform_cb.bind("<<ComboboxSelected>>", self._on_tts_platform_change)
 
-        # ElevenLabs sub-frame (mirror) — empty placeholder for visibility toggle
+        # ElevenLabs sub-frame (mirror) — holds the ElevenLabs model picker
         ef = tk.Frame(sp, bg="#1e1b3a")
         self._tts_el_frame_mirror = ef
+        self._build_el_model_picker(ef, "#1e1b3a")
 
         # Google TTS sub-frame (mirror)
         gf = tk.Frame(sp, bg="#1e1b3a")
@@ -5039,7 +5305,8 @@ class EndToEndApp:
             self._tts_tab_out_path = out_path
             self._tts_tab_out_label.config(text=out_path, fg=TEXT)
 
-        tts_platform, tts_lang_code, tts_voice_name, el_voice_id, pipeline_language = self._get_tts_params()
+        (tts_platform, tts_lang_code, tts_voice_name, el_voice_id,
+         pipeline_language, el_model) = self._get_tts_params()
 
         # Validate keys
         try:
@@ -5069,7 +5336,7 @@ class EndToEndApp:
                     )
                     synthesize_tts_elevenlabs(enriched_script, out_path,
                                               api_key=api_key, voice_id=el_voice_id,
-                                              status_cb=_cb)
+                                              model_id=el_model, status_cb=_cb)
                 else:
                     synthesize_tts(script, out_path, status_cb=_cb,
                                    lang_code=tts_lang_code, voice_name=tts_voice_name)
@@ -5093,11 +5360,11 @@ class EndToEndApp:
         """
         Standalone audio syncing tab. Inputs:
           • English audio file
-          • Bengali (already-dubbed) audio file
-          • Bengali dubbing script (text)
+          • target-language (already-dubbed) audio file
+          • target-language dubbing script (text)
 
-        Runs Stage 3a → 3e (English SRT, Bengali SRT, Gemini mapping,
-        SRT timing sync, synced Bengali audio). Skips Stage 1/2 entirely
+        Runs Stage 3a → 3e (English SRT, dubbed SRT, Gemini mapping,
+        SRT timing sync, synced dubbed audio). Skips Stage 1/2 entirely
         because the user is providing the dubbed audio + script directly.
         """
         tab = self.sync_tab
@@ -5118,11 +5385,11 @@ class EndToEndApp:
         self._as_run_btn.pack(side="left", padx=(4, 14), pady=10)
 
         self._as_status = tk.Label(
-            ctrl, text="Load English + Bengali audio and paste the script to begin.",
+            ctrl, text="Load English + dubbed audio and paste the script to begin.",
             bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9))
         self._as_status.pack(side="left", padx=8)
 
-        # ── Stacked layout: English (top) above Bengali (bottom) ───────────────
+        # ── Stacked layout: English (top) above dubbed audio (bottom) ──────────
         self._as_build_section(
             tab, side="en", title="ENGLISH AUDIO",
             colour=REG_EDGE, panel_bg=PANEL2,
@@ -5130,12 +5397,12 @@ class EndToEndApp:
             min_default=DEFAULT_MIN_MS)
 
         self._as_build_section(
-            tab, side="bn", title="BENGALI AUDIO",
+            tab, side="bn", title=f"{self._current_language().upper()} AUDIO",
             colour="#38bdf8", panel_bg="#0c1f2c",
             thr_default=DEFAULT_BN_THR_DB, hys_default=DEFAULT_BN_HYS_DB,
             min_default=DEFAULT_BN_MIN_MS)
 
-        # ── Bengali script input ───────────────────────────────────────────────
+        # ── Dubbing script input ───────────────────────────────────────────────
         script_hdr = tk.Frame(tab, bg="#1e1b3a", height=28, bd=0,
                               highlightbackground="#5b4fbf", highlightthickness=1)
         script_hdr.pack(fill="x", side="top", pady=(6, 0))
@@ -5195,6 +5462,421 @@ class EndToEndApp:
 
         # ── Bengali Captions panel (post-sync re-chunking) ───────────────────
         self._build_captions_panel(self.sync_tab)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  History tab — past runs, edit saved text, re-dub
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_history_tab(self):
+        tab = self.hist_tab
+
+        ctrl = tk.Frame(tab, bg=PANEL, height=52, bd=0,
+                        highlightbackground=PANEL_BORDER, highlightthickness=1)
+        ctrl.pack(fill="x", side="top")
+        ctrl.pack_propagate(False)
+
+        tk.Label(ctrl, text="RUN HISTORY", bg=PANEL, fg=TR_ACCENT,
+                 font=(MONO_FONT, 10, "bold")).pack(side="left",
+                                                    padx=(14, 10), pady=14)
+        tk.Frame(ctrl, bg="#334155", width=2, height=28).pack(
+            side="left", padx=8, pady=12)
+
+        self._hist_redub_btn = self._btn(
+            ctrl, "✏ Edit Text & Re-Dub", self._history_redub_selected,
+            bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e")
+        self._hist_redub_btn.pack(side="left", padx=(4, 6), pady=10)
+
+        self._btn(ctrl, "📂 Open Folder", self._history_open_folder,
+                  bg="#172554", fg=REG_LABEL, abg="#1e3a8a"
+                  ).pack(side="left", padx=(0, 6), pady=10)
+        self._btn(ctrl, "➕ Add Existing…", self._history_add_existing,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT
+                  ).pack(side="left", padx=(0, 6), pady=10)
+        self._btn(ctrl, "↻ Refresh", self._history_refresh,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT
+                  ).pack(side="left", padx=(0, 6), pady=10)
+        self._btn(ctrl, "🗑 Remove", self._history_remove_selected,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414"
+                  ).pack(side="left", padx=(0, 6), pady=10)
+
+        tk.Label(tab,
+                 text="Every translated run is saved here. Select one → "
+                      "“Edit Text & Re-Dub” re-opens the saved translation for "
+                      "editing (even days later) and re-runs dubbing + syncing — "
+                      "no re-translation cost. Nothing is overwritten: old text "
+                      "is kept as _FinalScript_vNN.txt, new audio gets a "
+                      "_redubNN suffix.",
+                 bg=BG, fg=TEXT_FAINT, font=(MONO_FONT, 9),
+                 anchor="w", justify="left", wraplength=1100
+                 ).pack(fill="x", padx=14, pady=(8, 0))
+
+        list_frame = tk.Frame(tab, bg=BG)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+        cols = ("Date", "Language", "Audio", "Source", "Folder")
+        self.hist_tree = ttk.Treeview(list_frame, columns=cols,
+                                      show="headings", selectmode="browse")
+        style = ttk.Style()
+        style.configure("Hist.Treeview", background=PANEL, foreground=TEXT,
+                        fieldbackground=PANEL, rowheight=26,
+                        font=(MONO_FONT, 9))
+        style.configure("Hist.Treeview.Heading", background=PANEL2,
+                        foreground=REG_EDGE, font=(MONO_FONT, 9, "bold"))
+        style.map("Hist.Treeview", background=[("selected", "#1e3a8a")],
+                  foreground=[("selected", "#f8fafc")])
+        self.hist_tree.configure(style="Hist.Treeview")
+        for col, width in [("Date", 150), ("Language", 90), ("Audio", 240),
+                           ("Source", 90), ("Folder", 380)]:
+            self.hist_tree.heading(col, text=col)
+            self.hist_tree.column(col, width=width, anchor="w")
+        vsb = ttk.Scrollbar(list_frame, orient="vertical",
+                            command=self.hist_tree.yview)
+        self.hist_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.hist_tree.pack(fill="both", expand=True)
+        self.hist_tree.bind("<Double-1>",
+                            lambda _e: self._history_redub_selected())
+
+        self._hist_status = tk.Label(tab, text="", bg=BG, fg=TEXT_FAINT,
+                                     font=(MONO_FONT, 9), anchor="w")
+        self._hist_status.pack(fill="x", padx=14, pady=(0, 8))
+
+        self._hist_entries = []
+        self._hist_redub_running = False
+        self._history_refresh()
+
+    def _history_refresh(self):
+        self._hist_entries = _history_load()
+        tree = self.hist_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        for idx, e in enumerate(self._hist_entries):
+            tree.insert("", "end", iid=str(idx), values=(
+                e.get("ts", "?"), e.get("language", "?"),
+                os.path.basename(e.get("audio_path", "")) or "?",
+                e.get("source", ""),
+                e.get("outdir", "")))
+        n = len(self._hist_entries)
+        self._hist_status.config(
+            text=(f"{n} run(s) in history." if n else
+                  "No runs recorded yet — run a translation, or use "
+                  "➕ Add Existing… to register an old output folder."),
+            fg=TEXT_FAINT)
+
+    def _history_selected_entry(self):
+        sel = self.hist_tree.selection()
+        if not sel:
+            self._hist_status.config(text="Select a run in the list first.",
+                                     fg="#fbbf24")
+            return None
+        try:
+            return self._hist_entries[int(sel[0])]
+        except Exception:
+            return None
+
+    def _history_open_folder(self):
+        e = self._history_selected_entry()
+        if not e:
+            return
+        path = e.get("outdir", "")
+        if not os.path.isdir(path):
+            self._hist_status.config(text=f"Folder missing: {path}",
+                                     fg="#f87171")
+            return
+        import subprocess
+        try:
+            if IS_WINDOWS:
+                os.startfile(path)  # noqa — Windows only
+            elif IS_MAC:
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as ex:
+            self._hist_status.config(text=f"Could not open folder: {ex}",
+                                     fg="#f87171")
+
+    def _history_remove_selected(self):
+        e = self._history_selected_entry()
+        if not e:
+            return
+        if not messagebox.askyesno(
+                "Remove from history",
+                "Remove this entry from the history list?\n\n"
+                "Files on disk are NOT deleted."):
+            return
+        _history_remove(e.get("base", ""), e.get("language", ""))
+        self._history_refresh()
+
+    def _history_add_existing(self):
+        folder = filedialog.askdirectory(
+            title="Select an output folder (contains *_FinalScript.txt)")
+        if not folder:
+            return
+        fs = sorted(f for f in os.listdir(folder)
+                    if f.endswith("_FinalScript.txt"))
+        if not fs:
+            self._hist_status.config(
+                text="No *_FinalScript.txt found in that folder.",
+                fg="#f87171")
+            return
+        fs_path = os.path.join(folder, fs[0])
+        base = fs_path[:-len("_FinalScript.txt")]
+
+        # Detect language from the "=== <LANG> TRANSLATION ===" marker
+        language = ""
+        try:
+            with open(fs_path, "r", encoding="utf-8") as f:
+                head = f.read(6000)
+            for lang in TTS_LANGUAGES:
+                if f"=== {lang.upper()} TRANSLATION ===" in head:
+                    language = lang
+                    break
+        except Exception:
+            pass
+        if not language:
+            language = self._current_language()
+
+        # The pipeline copies the original audio into the output folder
+        audio_path = ""
+        for ext in AUDIO_EXTENSIONS:
+            cand = base + ext
+            if os.path.exists(cand):
+                audio_path = cand
+                break
+        if not audio_path:
+            self._hist_status.config(
+                text="Added — but no matching audio file found in the folder; "
+                     "re-dub will reuse the saved English SRT if present.",
+                fg="#fbbf24")
+        _history_record(audio_path or base + ".wav", folder, base,
+                        language, "added")
+        self._history_refresh()
+
+    def _history_redub_selected(self):
+        if self._hist_redub_running:
+            return
+        e = self._history_selected_entry()
+        if not e:
+            return
+        base       = e.get("base", "")
+        outdir     = e.get("outdir", "")
+        language   = e.get("language", "")
+        audio_path = e.get("audio_path", "")
+        fs_path    = base + "_FinalScript.txt"
+        if not os.path.exists(fs_path):
+            self._hist_status.config(text=f"FinalScript missing: {fs_path}",
+                                     fg="#f87171")
+            return
+        if language != self._current_language():
+            messagebox.showwarning(
+                "Language mismatch",
+                f"This run is {language}, but the TTS panel is set to "
+                f"{self._current_language()}.\n\nSwitch the Language dropdown "
+                f"in TTS Settings to {language} (so the right voice is used), "
+                "then try again.")
+            return
+        try:
+            _get_api_key()
+        except Exception as ex:
+            messagebox.showerror("ElevenLabs API Key Error", str(ex))
+            return
+        try:
+            _validate_llm_config()
+        except Exception as ex:
+            messagebox.showerror("LLM Provider Error", str(ex))
+            return
+
+        (tts_platform, tts_lang_code, tts_voice_name,
+         el_voice_id, _lang, el_model) = self._get_tts_params()
+        en_thr, en_hys, en_min = self._get_en_region_params()
+        te_thr, te_hys, te_min = self._get_bn_region_params()
+        gemini_model = self._gemini_model_var.get()
+        emotion_on   = self._emotion_enabled_var.get()
+
+        self._hist_redub_running = True
+        self._hist_redub_btn.config(state="disabled")
+
+        def _st(msg, colour=TEXT_FAINT):
+            self.root.after(0, lambda: self._hist_status.config(
+                text=msg, fg=colour))
+
+        def _worker():
+            try:
+                with open(fs_path, "r", encoding="utf-8") as f:
+                    combined_old = f.read()
+                script_text = _extract_translation_from_finalscript(
+                    combined_old, language)
+                raw_eng = ""
+                if combined_old.startswith("=== ENGLISH TRANSCRIPTION ==="):
+                    raw_eng = combined_old.split(
+                        "=== ENGLISH TRANSCRIPTION ===", 1)[1]
+                    raw_eng = raw_eng.split("===", 1)[0].strip()
+
+                # Left column of the review window: the run's segment SRT if
+                # it was saved, else the whole English text as one box.
+                en_entries = []
+                srt_path = base + ".srt"
+                if os.path.exists(srt_path):
+                    with open(srt_path, "r", encoding="utf-8") as f:
+                        en_entries = _extract_srt_entries(f.read())
+                if not en_entries and raw_eng:
+                    en_entries = [(0.0, 0.0, raw_eng)]
+
+                y_data, sr = None, None
+                if audio_path and os.path.exists(audio_path):
+                    _st("Loading English audio…")
+                    try:
+                        y_data, sr = librosa.load(audio_path, sr=None,
+                                                  mono=True)
+                    except Exception:
+                        y_data, sr = None, None
+
+                # ── Review / edit window (the point of a re-dub) ────────────
+                _st("Waiting for text review — edit, then Continue…",
+                    "#d97706")
+                res, done = {}, threading.Event()
+                tr_paras = _split_translation_paragraphs(script_text)
+                self.root.after(0, lambda: self._show_translation_review(
+                    en_entries, tr_paras, language, res, done,
+                    audio=y_data, sr=sr))
+                done.wait()
+                new_text = script_text
+                if (res.get("action") == "continue"
+                        and (res.get("text") or "").strip()):
+                    new_text = res["text"].strip()
+
+                rev = _history_next_redub_rev(outdir)
+
+                # Preserve the old text before replacing the canonical file.
+                if new_text != script_text:
+                    backup = f"{base}_FinalScript_v{rev - 1:02d}.txt"
+                    if not os.path.exists(backup):
+                        shutil.copy2(fs_path, backup)
+                    header = (f"=== ENGLISH TRANSCRIPTION ===\n{raw_eng}\n\n"
+                              if raw_eng else "")
+                    with open(fs_path, "w", encoding="utf-8") as f:
+                        f.write(header + f"=== {language.upper()} TRANSLATION "
+                                         f"===\n{new_text}")
+
+                api_key = _get_api_key()
+
+                # ── TTS ─────────────────────────────────────────────────────
+                def _cb(msg):
+                    _st(f"Re-dub {rev:02d}: {msg}", "#d97706")
+
+                _st(f"Re-dub {rev:02d}: emotion pass…", "#d97706")
+                enriched = (_run_emotion_enrichment(
+                                new_text, language=language,
+                                model=GEMINI_DEFAULT_MODEL, status_cb=_cb)
+                            if emotion_on else new_text)
+                name_src = audio_path or base + ".wav"
+                tts_path = os.path.join(outdir, _tts_output_name(
+                    language, name_src, f"_tts_redub{rev:02d}"))
+                _st(f"Re-dub {rev:02d}: synthesizing speech…", "#d97706")
+                if tts_platform == "ElevenLabs":
+                    synthesize_tts_elevenlabs(enriched, tts_path,
+                                              api_key=api_key,
+                                              voice_id=el_voice_id,
+                                              model_id=el_model,
+                                              status_cb=_cb)
+                else:
+                    synthesize_tts(_strip_emotion_tags(enriched), tts_path,
+                                   status_cb=_cb, lang_code=tts_lang_code,
+                                   voice_name=tts_voice_name)
+
+                # ── English SRT: reuse the saved one, else re-transcribe ───
+                en_srt = ""
+                en_srt_path = base + "_sync_en.srt"
+                if os.path.exists(en_srt_path):
+                    with open(en_srt_path, "r", encoding="utf-8") as f:
+                        en_srt = f.read()
+                if not en_srt.strip():
+                    if y_data is None:
+                        raise ValueError(
+                            "No saved _sync_en.srt and the English audio is "
+                            f"missing ({audio_path or 'no path'}) — cannot "
+                            "build the sync map.")
+                    _st(f"Re-dub {rev:02d}: transcribing English audio…",
+                        "#d97706")
+                    en_regions = _detect_regions_from_audio(
+                        y_data, sr, en_thr, en_hys, en_min)
+                    en_result = _transcribe_audio(audio_path, api_key)
+                    en_words  = en_result.get("words", [])
+                    if not en_words:
+                        raise ValueError(
+                            "No word data from ElevenLabs for English audio.")
+                    en_srt = _build_english_subtitle_srt(en_regions, en_words)
+                    with open(en_srt_path, "w", encoding="utf-8") as f:
+                        f.write(en_srt)
+
+                # ── Dubbed SRT from the fresh TTS audio ────────────────────
+                _st(f"Re-dub {rev:02d}: transcribing new {language} audio…",
+                    "#d97706")
+                te_y, te_sr = librosa.load(tts_path, sr=None, mono=True)
+                te_regions = _detect_regions_from_audio(
+                    te_y, te_sr, te_thr, te_hys, te_min)
+                if not te_regions:
+                    raise ValueError("No regions detected in the new TTS audio.")
+                te_result = _transcribe_audio(tts_path, api_key)
+                te_words  = te_result.get("words", [])
+                if not te_words:
+                    raise ValueError(
+                        f"No word data for the new {language} audio.")
+                te_srt = _build_target_subtitle_srt(te_regions, te_words)
+                with open(f"{base}_sync_te_redub{rev:02d}.srt", "w",
+                          encoding="utf-8") as f:
+                    f.write(te_srt)
+
+                # ── Mapping + timing sync + synced audio ───────────────────
+                _st(f"Re-dub {rev:02d}: Gemini SRT mapping…", "#d97706")
+                mapping_text = _call_gemini_mapping(
+                    en_srt, te_srt, new_text, gemini_model, language=language)
+                with open(f"{base}_sync_mapping_redub{rev:02d}.txt", "w",
+                          encoding="utf-8") as f:
+                    f.write(mapping_text)
+
+                _st(f"Re-dub {rev:02d}: syncing…", "#d97706")
+                en_dur = (float(len(y_data)) / float(sr)
+                          if (y_data is not None and sr) else 0.0)
+                synced_subs, orig_te_subs, sync_log = run_sync_from_strings(
+                    en_srt, te_srt, mapping_text, en_audio_duration=en_dur)
+                with open(f"{base}_sync_log_redub{rev:02d}.txt", "w",
+                          encoding="utf-8") as f:
+                    f.write(sync_log)
+                synced_srt_path = f"{base}_sync_synced_redub{rev:02d}.srt"
+                with open(synced_srt_path, "w", encoding="utf-8") as f:
+                    f.write(_write_srt_from_dict(synced_subs))
+                self.root.after(0, lambda p=synced_srt_path:
+                                setattr(self, "_last_synced_srt_path", p))
+                ts_list = _build_timestamps(orig_te_subs, synced_subs)
+                with open(f"{base}_sync_timestamps_redub{rev:02d}.txt", "w",
+                          encoding="utf-8") as f:
+                    f.write(_format_timestamps_as_text(ts_list))
+
+                _st(f"Re-dub {rev:02d}: building synced audio…", "#d97706")
+                synced_path = os.path.join(outdir, _tts_output_name(
+                    language, name_src, f"_synced_redub{rev:02d}"))
+                sync_audio_with_timestamps(tts_path, ts_list, synced_path,
+                                           status_cb=_cb)
+
+                _history_record(audio_path, outdir, base, language,
+                                e.get("source", "single"))
+                _st(f"✔ Re-dub {rev:02d} complete → "
+                    f"{os.path.basename(synced_path)}", TR_ACCENT)
+                self.root.after(0, self._history_refresh)
+
+            except Exception as exc:
+                import traceback
+                err, tb = str(exc), traceback.format_exc()
+                _st(f"Error: {err[:90]}", "#f87171")
+                self.root.after(0, lambda e2=err, t2=tb: messagebox.showerror(
+                    "Re-Dub Error", f"{e2}\n\n{t2[:600]}"))
+            finally:
+                def _fin():
+                    self._hist_redub_running = False
+                    self._hist_redub_btn.config(state="normal")
+                self.root.after(0, _fin)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _build_captions_panel(self, parent):
         """
@@ -5277,7 +5959,7 @@ class EndToEndApp:
             with open(path, "r", encoding="utf-8") as f:
                 return f.read(), path
         raise ValueError(
-            "No synced Bengali SRT found yet. Run the pipeline (Sync Audio / "
+            "No synced SRT found yet. Run the pipeline (Sync Audio / "
             "Run Pipeline) at least once so the captions can be re-chunked.")
 
     def _captions_params(self) -> Tuple[int, float]:
@@ -5339,7 +6021,7 @@ class EndToEndApp:
             initname = f"{base}_captions_{mc}c_{ms:.1f}s.srt"
 
         out_path = filedialog.asksaveasfilename(
-            title="Save Bengali captions SRT as…",
+            title=f"Save {self._current_language()} captions SRT as…",
             defaultextension=".srt",
             initialdir=initdir or None,
             initialfile=initname or None,
@@ -5357,7 +6039,7 @@ class EndToEndApp:
 
     def _as_build_section(self, parent, side, title, colour, panel_bg,
                           thr_default, hys_default, min_default):
-        """Build one half (English or Bengali) of the Audio Syncing tab."""
+        """Build one half (English or dubbed audio) of the Audio Syncing tab."""
         st = self._as_state[side]
 
         # ── File picker row ───────────────────────────────────────────────────
@@ -5452,7 +6134,8 @@ class EndToEndApp:
         ax.grid(True, axis="x", color=GRID, linewidth=0.5,
                 linestyle="--", alpha=0.6)
         ax.text(0.5, 0.5,
-                f"Open {title.split()[0].lower()} audio — waveform loads here",
+                f"Open {'English' if side == 'en' else 'dubbed'} audio — "
+                "waveform loads here",
                 ha="center", va="center", transform=ax.transAxes,
                 color=TEXT_MUTED, fontsize=10, fontfamily="monospace")
         ax.set_xticks([]); ax.set_yticks([])
@@ -5493,7 +6176,9 @@ class EndToEndApp:
     # ─────────────────────────────────────────────────────────────────────────
     def _as_pick_file(self, side):
         path = filedialog.askopenfilename(
-            title=f"Open {'English' if side == 'en' else 'Bengali'} audio file",
+            title=(f"Open "
+                   f"{'English' if side == 'en' else self._current_language()}"
+                   f" audio file"),
             filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a"),
                        ("All Files", "*.*")])
         if not path:
@@ -5757,8 +6442,9 @@ class EndToEndApp:
                 "Open an English audio file first.")
             return
         if te["audio"] is None or not te["filepath"]:
-            messagebox.showwarning("Missing Bengali Audio",
-                "Open a Bengali (dubbed) audio file first.")
+            messagebox.showwarning(
+                f"Missing {self._current_language()} Audio",
+                f"Open a {self._current_language()} (dubbed) audio file first.")
             return
         if not en["regions"]:
             messagebox.showwarning("No English Regions",
@@ -5772,7 +6458,8 @@ class EndToEndApp:
         script_text = self._as_script_text.get("1.0", "end").strip()
         if not script_text:
             messagebox.showwarning("Missing Script",
-                "Paste the Bengali dubbing script in the text box first.")
+                f"Paste the {self._current_language()} dubbing script "
+                f"in the text box first.")
             return
 
         # Validate API keys
@@ -5842,6 +6529,8 @@ class EndToEndApp:
                     with open(base + "_FinalScript.txt", "w", encoding="utf-8") as f:
                         f.write(f"=== {pipeline_language.upper()} TRANSLATION ===\n"
                                 + script_text)
+                    _history_record(en_path, outdir, base, pipeline_language,
+                                    "audio-sync")
                 except Exception:
                     pass
 
@@ -5966,6 +6655,310 @@ class EndToEndApp:
         self.tr_status.config(text="Cancelling…", fg="#f87171")
         self.status.config(text="Cancel requested — stopping after current step…")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Manual translation review (pipeline pause before dubbing)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _show_translation_review(self, en_entries, tr_paragraphs, language,
+                                 result_holder, done_event,
+                                 audio=None, sr=None):
+        """
+        Modal side-by-side review of the translation before dubbing.
+
+        Left column: the English transcription (read-only, no timecodes),
+        grouped via _pair_review_rows so each box faces its corresponding
+        translation paragraph. Right column: the translation paragraphs
+        (editable). When *audio* (numpy array) and *sr* are given, each row
+        gets a ▶ button that plays that row's slice of the English audio
+        with a karaoke-style sweep over the text. Must be called on the Tk
+        main thread; the pipeline worker blocks on *done_event*.
+
+        Fills *result_holder* with:
+            action — "skip" (dub the script unchanged) or
+                     "continue" (dub the edited text)
+            text   — the edited script when action == "continue"
+        """
+        win = tk.Toplevel(self.root)
+        result_holder["win"] = win
+        win.title(f"Review Translation — {language}")
+        win.configure(bg=BG)
+        win.geometry("1200x800")
+        win.minsize(760, 480)
+        win.transient(self.root)
+        win.grab_set()
+
+        lang_up = language.upper()
+
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = tk.Frame(win, bg=PANEL, height=46)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text=f"REVIEW {lang_up} TRANSLATION", bg=PANEL,
+                 fg=TR_ACCENT, font=(MONO_FONT, 10, "bold")
+                 ).pack(side="left", padx=14, pady=12)
+        tk.Label(hdr,
+                 text=f"English is read-only — edit the {language} boxes if "
+                      "needed, then Continue. Skip dubs the script unchanged. "
+                      "(Row pairing is approximate.)",
+                 bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9)
+                 ).pack(side="left", padx=8)
+
+        # ── Footer (packed before the middle so it never collapses) ───────
+        ftr = tk.Frame(win, bg=PANEL, height=52)
+        ftr.pack(fill="x", side="bottom")
+        ftr.pack_propagate(False)
+
+        status_lbl = tk.Label(
+            ftr,
+            text=(f"{len(en_entries)} English segment(s) · "
+                  f"{len(tr_paragraphs)} {language} paragraph(s)"),
+            bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9))
+        status_lbl.pack(side="left", padx=14)
+
+        has_audio = audio is not None and sr
+
+        # ── Column headers ────────────────────────────────────────────────
+        cols = tk.Frame(win, bg=BG)
+        cols.pack(fill="x", padx=14, pady=(8, 0))
+        cols.columnconfigure(0, minsize=PLAY_COL_W if has_audio else 0)
+        cols.columnconfigure(1, weight=1, uniform="rev")
+        cols.columnconfigure(2, weight=1, uniform="rev")
+        tk.Label(cols, text="ENGLISH TRANSCRIPTION"
+                 + ("  (▶ = hear it)" if has_audio else ""),
+                 bg=BG, fg=REG_LABEL,
+                 font=(MONO_FONT, 9, "bold"), anchor="w"
+                 ).grid(row=0, column=1, sticky="w")
+        tk.Label(cols, text=f"{lang_up} TRANSLATION (editable)", bg=BG,
+                 fg=ACCENT, font=(MONO_FONT, 9, "bold"), anchor="w"
+                 ).grid(row=0, column=2, sticky="w", padx=(10, 0))
+
+        # ── Scrollable paired boxes ───────────────────────────────────────
+        mid = tk.Frame(win, bg=BG)
+        mid.pack(fill="both", expand=True, padx=14, pady=6)
+
+        canvas = tk.Canvas(mid, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=canvas.yview,
+                            style="Vertical.TScrollbar")
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=BG)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.columnconfigure(0, minsize=PLAY_COL_W if has_audio else 0)
+        inner.columnconfigure(1, weight=1, uniform="rev")
+        inner.columnconfigure(2, weight=1, uniform="rev")
+
+        inner.bind("<Configure>", lambda _e:
+                   canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e:
+                    canvas.itemconfigure(inner_id, width=e.width))
+
+        def _on_wheel(event):
+            if getattr(event, "num", None) == 4:      # X11 wheel up
+                step = -1
+            elif getattr(event, "num", None) == 5:    # X11 wheel down
+                step = 1
+            elif IS_MAC:
+                step = -event.delta
+            else:                                     # Windows: ±120 per notch
+                step = -event.delta // 120
+            canvas.yview_scroll(int(step), "units")
+            return "break"
+
+        def _bind_wheel(w):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                w.bind(seq, _on_wheel)
+
+        for w in (canvas, inner):
+            _bind_wheel(w)
+
+        rows = (_pair_review_rows(en_entries, tr_paragraphs)
+                or [("", "", None, None)])
+
+        # ── Per-row playback of the English audio ─────────────────────────
+        # play_state: r = playing row index, after_id = pending sweep tick.
+        play_state = {"r": None, "after_id": None, "t0": 0.0}
+        en_boxes, tr_boxes, play_btns = [], [], []
+
+        def _stop_play(reset_ui=True):
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            if play_state["after_id"] is not None:
+                try:
+                    win.after_cancel(play_state["after_id"])
+                except Exception:
+                    pass
+                play_state["after_id"] = None
+            r = play_state["r"]
+            play_state["r"] = None
+            if reset_ui and r is not None:
+                try:
+                    play_btns[r].config(text="▶", fg=_btn_fg(ACCENT))
+                    box = en_boxes[r]
+                    box.tag_remove("playpos", "1.0", "end")
+                    box.config(highlightbackground=PANEL_BORDER,
+                               highlightthickness=1)
+                except Exception:
+                    pass
+
+        def _sweep_tick(r, dur, n_chars):
+            if play_state["r"] != r:
+                return
+            elapsed = time.perf_counter() - play_state["t0"]
+            frac = min(1.0, elapsed / dur) if dur > 0 else 1.0
+            box = en_boxes[r]
+            try:
+                box.tag_remove("playpos", "1.0", "end")
+                box.tag_add("playpos", "1.0", f"1.0 + {int(frac * n_chars)} chars")
+            except Exception:
+                pass
+            if frac >= 1.0:
+                _stop_play()
+                return
+            play_state["after_id"] = win.after(
+                60, lambda: _sweep_tick(r, dur, n_chars))
+
+        def _toggle_row_play(r):
+            if play_state["r"] == r:          # clicked the playing row → stop
+                _stop_play()
+                return
+            _stop_play()
+            t0, t1 = rows[r][2], rows[r][3]
+            if t0 is None or t1 is None or t1 <= t0:
+                return
+            seg = audio[int(t0 * sr):int(t1 * sr)]
+            if len(seg) == 0:
+                return
+            try:
+                sd.play(seg.astype(np.float32), samplerate=sr)
+            except Exception as e:
+                status_lbl.config(text=f"Playback error: {e}", fg="#f87171")
+                return
+            play_state["r"] = r
+            play_state["t0"] = time.perf_counter()
+            play_btns[r].config(text="⏹", fg=_btn_fg("#f87171"))
+            en_boxes[r].config(highlightbackground=ACCENT, highlightthickness=2)
+            _sweep_tick(r, t1 - t0, len(rows[r][0]))
+
+        for i, (en_txt, tr_txt, seg_s, seg_e) in enumerate(rows):
+            # Shared row height so the pair stays visually aligned.
+            est = max(len(en_txt), len(tr_txt)) // 45 + 1 + tr_txt.count("\n")
+            h = max(2, min(14, est))
+
+            if has_audio:
+                can_play = seg_s is not None and seg_e is not None
+                btn = tk.Button(inner, text="▶" if can_play else " ",
+                                command=(lambda r=i: _toggle_row_play(r)),
+                                state="normal" if can_play else "disabled",
+                                bg=PANEL, fg=_btn_fg(ACCENT),
+                                activebackground=PANEL3,
+                                activeforeground=_btn_fg(ACCENT),
+                                font=(MONO_FONT, 10), relief="flat",
+                                cursor="hand2" if can_play else "arrow",
+                                width=2, bd=0)
+                btn.grid(row=i, column=0, sticky="n", padx=(0, 4), pady=3)
+                play_btns.append(btn)
+            else:
+                play_btns.append(None)
+
+            en_box = tk.Text(inner, height=h, wrap="word", bg=PANEL2, fg=TEXT,
+                             relief="flat", bd=0, padx=8, pady=6,
+                             font=(MONO_FONT, 10), highlightthickness=1,
+                             highlightbackground=PANEL_BORDER)
+            en_box.insert("1.0", en_txt)
+            # Karaoke sweep highlight while this row's audio plays.
+            en_box.tag_configure("playpos", background="#1e3a8a",
+                                 foreground="#f8fafc")
+            en_box.config(state="disabled")
+            en_box.grid(row=i, column=1, sticky="nsew", padx=(0, 5), pady=3)
+            en_boxes.append(en_box)
+
+            tr_box = tk.Text(inner, height=h, wrap="word", bg=INPUT_BG,
+                             fg=INPUT_FG, insertbackground=INPUT_FG,
+                             relief="flat", bd=0, padx=8, pady=6,
+                             font=(MONO_FONT, 11), highlightthickness=1,
+                             highlightbackground=PANEL_BORDER)
+            tr_box.insert("1.0", tr_txt)
+            tr_box.grid(row=i, column=2, sticky="nsew", padx=(5, 0), pady=3)
+            tr_boxes.append(tr_box)
+
+            # Wheel anywhere scrolls the whole list, not one Text widget.
+            _bind_wheel(en_box)
+            _bind_wheel(tr_box)
+
+        # ── Actions ───────────────────────────────────────────────────────
+        def _gather_text():
+            paras = [b.get("1.0", "end-1c").strip() for b in tr_boxes]
+            return "\n\n".join(p for p in paras if p)
+
+        def _copy(mode):
+            if mode == "tr":
+                payload = _gather_text()
+            else:
+                blocks = []
+                for i, b in enumerate(tr_boxes):
+                    en_txt = rows[i][0]
+                    tr_txt = b.get("1.0", "end-1c").strip()
+                    if not en_txt and not tr_txt:
+                        continue
+                    blocks.append(f"{en_txt}\n{tr_txt}".strip())
+                payload = "\n\n".join(blocks)
+            win.clipboard_clear()
+            win.clipboard_append(payload)
+            status_lbl.config(text="✓ Copied to clipboard", fg=TR_ACCENT)
+
+        def _finish(action):
+            if done_event.is_set():
+                return
+            _stop_play(reset_ui=False)
+            result_holder["action"] = action
+            if action == "continue":
+                txt = _gather_text()
+                if txt.strip():
+                    result_holder["text"] = txt
+                else:
+                    # Everything deleted — dub the original script instead.
+                    result_holder["action"] = "skip"
+            done_event.set()
+            win.destroy()
+
+        # Safety net: window destroyed any other way (app quit, Cmd+W)
+        # must never leave the pipeline worker waiting forever.
+        def _on_destroy(event):
+            if event.widget is win and not done_event.is_set():
+                _stop_play(reset_ui=False)
+                result_holder.setdefault("action", "skip")
+                done_event.set()
+        win.bind("<Destroy>", _on_destroy)
+        win.protocol("WM_DELETE_WINDOW", lambda: _finish("skip"))
+
+        tk.Button(ftr, text="✔ Continue to Dubbing",
+                  command=lambda: _finish("continue"),
+                  bg="#2563eb", fg=_btn_fg("white"),
+                  font=(MONO_FONT, 10, "bold"), relief="flat",
+                  cursor="hand2", padx=16
+                  ).pack(side="right", padx=(6, 14), pady=8)
+        tk.Button(ftr, text="⏭ Skip — Dub As-Is",
+                  command=lambda: _finish("skip"),
+                  bg=PANEL3, fg=_btn_fg(TEXT), font=(MONO_FONT, 10),
+                  relief="flat", cursor="hand2", padx=12
+                  ).pack(side="right", padx=6, pady=8)
+        tk.Button(ftr, text=f"📋 Copy English + {language}",
+                  command=lambda: _copy("both"),
+                  bg=PANEL3, fg=_btn_fg(TEXT), font=(MONO_FONT, 9),
+                  relief="flat", cursor="hand2", padx=10
+                  ).pack(side="right", padx=6, pady=8)
+        tk.Button(ftr, text=f"📋 Copy {language}",
+                  command=lambda: _copy("tr"),
+                  bg=PANEL3, fg=_btn_fg(TEXT), font=(MONO_FONT, 9),
+                  relief="flat", cursor="hand2", padx=10
+                  ).pack(side="right", padx=6, pady=8)
+
+        win.lift()
+        win.focus_force()
+
     def _run_full_pipeline(self):
         if not self.filepath:
             messagebox.showwarning("No file", "Open an audio file first.")
@@ -6000,7 +6993,8 @@ class EndToEndApp:
         regions       = list(self.regions)
         y_data        = self.audio_data
         sr            = self.sample_rate
-        tts_platform, tts_lang_code, tts_voice_name, el_voice_id, pipeline_language = self._get_tts_params()
+        (tts_platform, tts_lang_code, tts_voice_name, el_voice_id,
+         pipeline_language, el_model) = self._get_tts_params()
         en_thr, en_hys, en_min = self._get_en_region_params()
         te_thr, te_hys, te_min = self._get_bn_region_params()
 
@@ -6085,6 +7079,8 @@ class EndToEndApp:
                 final_path = base + "_FinalScript.txt"
                 with open(final_path, "w", encoding="utf-8") as f:
                     f.write(combined)
+                _history_record(filepath, outdir, base, pipeline_language,
+                                "single")
                 self.root.after(0, lambda: self._set_stage("S1b", "✔ Done", "#22c55e"))
                 self.root.after(0, lambda p=punc_result: setattr(self, "punctuation_result", p))
                 self.root.after(0, lambda s=final_srt: setattr(self, "final_srt", s))
@@ -6098,6 +7094,43 @@ class EndToEndApp:
                         self.status.config(text=f"Done! FinalScript → {final_path}")
                     self.root.after(0, _done_tr)
                     return
+
+                # ── Optional manual review before dubbing ────────────────────
+                if self._review_enabled_var.get():
+                    _chk()
+                    self.root.after(0, lambda: self._set_stage(
+                        "S2", "Waiting for manual review…", "#d97706"))
+                    self.root.after(0, lambda: self.status.config(
+                        text="Review the translation — Skip or Continue to start dubbing."))
+                    review_res = {}
+                    review_done = threading.Event()
+                    en_entries = _extract_srt_entries(final_srt)
+                    tr_paras = _split_translation_paragraphs(punc_result)
+                    self.root.after(0, lambda: self._show_translation_review(
+                        en_entries, tr_paras, pipeline_language,
+                        review_res, review_done,
+                        audio=y_data, sr=sr))
+                    try:
+                        while not review_done.wait(0.25):
+                            _chk()
+                    except InterruptedError:
+                        w = review_res.get("win")
+                        if w is not None:
+                            self.root.after(0, w.destroy)
+                        raise
+                    if (review_res.get("action") == "continue"
+                            and (review_res.get("text") or "").strip()):
+                        punc_result = review_res["text"].strip()
+                        # Rewrite FinalScript so the saved file matches what
+                        # actually gets dubbed.
+                        combined = (
+                            f"=== ENGLISH TRANSCRIPTION ===\n{raw_eng}\n\n"
+                            f"=== {pipeline_language.upper()} TRANSLATION ===\n"
+                            f"{punc_result}")
+                        with open(final_path, "w", encoding="utf-8") as f:
+                            f.write(combined)
+                        self.root.after(0, lambda p=punc_result: setattr(
+                            self, "punctuation_result", p))
 
                 # Stage 2: TTS
                 _chk()
@@ -6118,7 +7151,8 @@ class EndToEndApp:
                 self.root.after(0, lambda: self._set_stage("S2", "Synthesizing…", "#d97706"))
                 if tts_platform == "ElevenLabs":
                     synthesize_tts_elevenlabs(enriched_text, tts_path, api_key=api_key,
-                                              voice_id=el_voice_id, status_cb=_tts_status_cb)
+                                              voice_id=el_voice_id, model_id=el_model,
+                                              status_cb=_tts_status_cb)
                 else:
                     # Strip ElevenLabs-specific tags before sending to Google TTS
                     synthesize_tts(_strip_emotion_tags(enriched_text), tts_path,
@@ -6324,7 +7358,8 @@ class EndToEndApp:
     def _batch_worker(self):
         items = self.batch_tree.get_children()
         total = len(items)
-        tts_platform, tts_lang_code, tts_voice_name, el_voice_id, pipeline_language = self._get_tts_params()
+        (tts_platform, tts_lang_code, tts_voice_name, el_voice_id,
+         pipeline_language, el_model) = self._get_tts_params()
         en_thr, en_hys, en_min = self._get_en_region_params()
         te_thr, te_hys, te_min = self._get_bn_region_params()
 
@@ -6424,6 +7459,8 @@ class EndToEndApp:
                 final_path = os.path.join(outdir, base + "_FinalScript.txt")
                 with open(final_path, "w", encoding="utf-8") as f:
                     f.write(combined)
+                _history_record(fpath, outdir, os.path.join(outdir, base),
+                                pipeline_language, "batch")
 
                 self._batch_set_row(item, tr_status="✔ Done", tag="running")
 
@@ -6450,7 +7487,8 @@ class EndToEndApp:
                 )
                 if tts_platform == "ElevenLabs":
                     synthesize_tts_elevenlabs(batch_enriched, tts_path,
-                                              api_key=api_key, voice_id=el_voice_id)
+                                              api_key=api_key, voice_id=el_voice_id,
+                                              model_id=el_model)
                 else:
                     synthesize_tts(_strip_emotion_tags(batch_enriched), tts_path,
                                    lang_code=tts_lang_code, voice_name=tts_voice_name)

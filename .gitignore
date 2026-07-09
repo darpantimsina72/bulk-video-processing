@@ -13,6 +13,8 @@ vertex_key.json
 
 # Runtime state
 last_language.txt
+run_history.json
+el_model.txt
 error_log.txt
 launch_log.txt
 _update_backup/
