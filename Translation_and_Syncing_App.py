@@ -140,7 +140,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.1.0"
+APP_VERSION  = "1.1.1"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -212,6 +212,15 @@ def _tk_exception_handler(exc_type, exc_value, exc_tb):
     the console window closes and the error is never seen)."""
     text = _log_exception(exc_type, exc_value, exc_tb)
     short = str(exc_value) or exc_type.__name__
+    try:
+        # Never attach a modal error box to a minimized window — on Windows
+        # the box is invisible but still grabs input, so the app looks
+        # frozen and cannot be restored from the taskbar.
+        _root = tk._default_root
+        if _root is not None and _root.state() == "iconic":
+            _root.deiconify()
+    except Exception:
+        pass
     try:
         messagebox.showerror(
             "Unexpected Error",
@@ -4741,7 +4750,10 @@ class EndToEndApp:
         dlg.configure(bg=PANEL)
         dlg.resizable(False, False)
         dlg.transient(self.root)
-        dlg.grab_set()
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass   # not viewable yet (minimized parent) — run non-modal
 
         provider_var    = tk.StringVar(value=s.get("provider", LLM_PROVIDER_VERTEX))
         vertex_json_var = tk.StringVar(value=s.get("vertex_json", ""))
@@ -4901,7 +4913,10 @@ class EndToEndApp:
         dlg.configure(bg=PANEL)
         dlg.geometry("860x640")
         dlg.transient(self.root)
-        dlg.grab_set()
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass   # not viewable yet (minimized parent) — run non-modal
 
         languages = list(TTS_LANGUAGES.keys())
         cur_lang  = self._tts_language_var.get() if self._tts_language_var else languages[0]
@@ -5868,6 +5883,7 @@ class EndToEndApp:
                 import traceback
                 err, tb = str(exc), traceback.format_exc()
                 _st(f"Error: {err[:90]}", "#f87171")
+                self.root.after(0, self._ensure_window_visible)
                 self.root.after(0, lambda e2=err, t2=tb: messagebox.showerror(
                     "Re-Dub Error", f"{e2}\n\n{t2[:600]}"))
             finally:
@@ -6626,6 +6642,7 @@ class EndToEndApp:
                 tb  = traceback.format_exc()
                 self.root.after(0, lambda e=err:
                     self._as_status.config(text=f"Error: {e[:80]}", fg="#f87171"))
+                self.root.after(0, self._ensure_window_visible)
                 self.root.after(0, lambda e=err, t=tb:
                     messagebox.showerror("Audio Syncing Error",
                                          f"{e}\n\n{t[:600]}"))
@@ -6677,6 +6694,15 @@ class EndToEndApp:
                      "continue" (dub the edited text)
             text   — the edited script when action == "continue"
         """
+        # The pipeline opens this dialog programmatically — often while the
+        # user has the app minimized during the long LLM wait. On Windows a
+        # transient child of an iconified window is created hidden, and
+        # grab_set() on a hidden window raises "grab failed: window not
+        # viewable", leaving a half-built dialog + invisible modal that
+        # blocks the whole app from being restored. So: restore the main
+        # window first, and only grab once the dialog is actually viewable.
+        self._ensure_window_visible()
+
         win = tk.Toplevel(self.root)
         result_holder["win"] = win
         win.title(f"Review Translation — {language}")
@@ -6684,7 +6710,17 @@ class EndToEndApp:
         win.geometry("1200x800")
         win.minsize(760, 480)
         win.transient(self.root)
-        win.grab_set()
+
+        def _try_grab(attempt=0):
+            try:
+                win.grab_set()
+            except tk.TclError:
+                # Not viewable yet — Windows maps it a few ticks later.
+                # Retry briefly; if it never becomes grabbable, the dialog
+                # simply runs non-modal instead of crashing.
+                if attempt < 20 and win.winfo_exists():
+                    win.after(100, lambda: _try_grab(attempt + 1))
+        win.after(50, _try_grab)
 
         lang_up = language.upper()
 
@@ -6956,8 +6992,21 @@ class EndToEndApp:
                   relief="flat", cursor="hand2", padx=10
                   ).pack(side="right", padx=6, pady=8)
 
-        win.lift()
-        win.focus_force()
+        try:
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+
+    def _ensure_window_visible(self):
+        """Restore the main window if it is minimized. Any modal dialog or
+        input grab created on top of an iconified window locks the app on
+        Windows (invisible modal holds the grab; taskbar restore is dead)."""
+        try:
+            if self.root.state() == "iconic":
+                self.root.deiconify()
+        except Exception:
+            pass
 
     def _run_full_pipeline(self):
         if not self.filepath:
@@ -7288,6 +7337,7 @@ class EndToEndApp:
                     self.btn_cancel_pipeline.config(state="disabled")
                     self.tr_status.config(text=f"Error: {err[:60]}", fg="#f87171")
                     self.status.config(text=f"Error: {err[:100]}")
+                    self._ensure_window_visible()
                     messagebox.showerror("Pipeline Error", f"{err}\n\n{tb[:600]}")
 
                 self.root.after(0, _on_error)
