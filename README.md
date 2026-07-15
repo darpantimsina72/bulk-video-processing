@@ -69,6 +69,52 @@ Maintainers: to publish an update, push your changes **and bump the number in
 the `VERSION` file** (and `APP_VERSION` in `Translation_and_Syncing_App.py`) —
 the update button triggers only when `VERSION` on GitHub is higher.
 
+## Sending feedback from the app
+
+Click **💬 Send Feedback** (top row in the Translation tab). Pick a type
+(Feedback / Improvement / Bug), write your message, optionally attach
+screenshot files (PNG/JPG, up to 20 MB each), and hit **Send**. The report
+lands with the developer as a GitHub issue, with screenshots linked.
+
+If GitHub can't be reached (no internet, or no `github_token.txt`), the
+feedback is saved to `feedback_outbox/<timestamp>/` next to the app — send
+that folder to the developer by e-mail or chat instead.
+
+Maintainers — one-time setup:
+
+1. Create a **private** GitHub repo for feedback (default:
+   `darpantimsina72/app-feedback` — change `FEEDBACK_REPO` in
+   `Translation_and_Syncing_App.py` if you use another name). Initialize it
+   with a README so it has a default branch.
+2. Create a **fine-grained personal access token** scoped to *only that
+   repo*, with **Issues: Read & write** and **Contents: Read & write**.
+   This token cannot touch the app repo, so installs can never alter the
+   code the updater pulls.
+3. Put the token in a `github_token.txt` file next to the app on each
+   install (same file the updater uses for private repos).
+4. Watch the feedback repo (GitHub → Watch → All activity) to get an e-mail
+   for every new report. Screenshots are committed to its `feedback`
+   branch under `feedback_attachments/`.
+
+## Translation memory (feedback loop)
+
+The app remembers translations a human has reviewed and reuses them:
+
+- When you click **✔ Continue to Dubbing** in the review window (normal run
+  or re-dub), the reviewed script is saved to a local memory
+  (`data/translation_memory.db`).
+- Next time the **same English content** is processed (single or batch), the
+  proofed script is reused directly — **no LLM call, zero cost** — and the
+  status bar shows a 🧠 memory hit.
+- When only **parts** of the content were seen before, the approved
+  translations are injected into the translation prompt so wording stays
+  consistent with what reviewers approved.
+
+Controlled by the **Translation memory** checkbox in the Translation tab
+(on by default). The memory is per-computer and never uploaded.
+To temporarily bypass reuse without losing capture, launch with the
+environment variable `TM_REUSE_DISABLE=1`.
+
 ## Where output files go
 
 Next to your input audio file, in a new subfolder named after the file.

@@ -12,6 +12,8 @@ vertex_key.json
 *.json.key
 
 # Runtime state
+# (data/ holds the local translation-memory SQLite DB — per-machine)
+data/
 last_language.txt
 run_history.json
 el_model.txt
@@ -23,3 +25,4 @@ logs/
 # Local tooling
 .claude/
 github_token.txt
+feedback_outbox/

@@ -60,6 +60,7 @@ import sys
 import time
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import tkinter as tk
 from copy import deepcopy
@@ -78,6 +79,13 @@ try:
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
+
+# Translation memory — proofed-translation feedback loop (optional module;
+# the app must keep working if translation_memory.py wasn't copied along).
+try:
+    import translation_memory
+except Exception:
+    translation_memory = None
 
 def _fatal_import_error(lib_name: str, detail: str):
     """A required library failed to import. Print + log + dialog, then exit
@@ -140,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.1.1"
+APP_VERSION  = "1.2.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -237,6 +245,8 @@ _UPDATE_PROTECTED = {
     "api.txt", "llm_settings.json", "last_language.txt",
     "TTS_Key.json", "vertex_key.json", "error_log.txt",
     "github_token.txt", "launch_log.txt",
+    "data",  # local translation-memory DB — never overwrite
+    "feedback_outbox",  # locally saved feedback awaiting manual delivery
 }
 
 
@@ -329,6 +339,108 @@ def download_and_apply_update() -> str:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
     return backup_dir
+
+
+# ─── In-app feedback (message + optional screenshots → GitHub issue) ─────────
+# Feedback goes to a DEDICATED repo, not the app repo: the github_token.txt
+# distributed with installs only ever needs write access to this repo, so it
+# can never be used to alter the app code the updater pulls from main.
+# One-time setup: create the (private) repo below with a README, then issue a
+# fine-grained PAT with Issues+Contents read/write on it → github_token.txt.
+FEEDBACK_REPO = "darpantimsina72/app-feedback"   # owner/repo on GitHub
+FEEDBACK_BRANCH = "feedback"   # attachments branch, keeps default branch lean
+FEEDBACK_MAX_ATTACHMENT_MB = 20
+
+
+def _github_api_json(url: str, payload: Optional[dict] = None,
+                     method: str = "GET") -> dict:
+    """Call the GitHub REST API using the token from github_token.txt.
+    Returns the decoded JSON response; raises urllib.error.HTTPError on 4xx/5xx."""
+    h = {"User-Agent": "TranslationSyncApp-Feedback",
+         "Accept": "application/vnd.github+json"}
+    tok = _github_token()
+    if tok:
+        h["Authorization"] = f"token {tok}"
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), ssl.SSLError):
+            with urllib.request.urlopen(req, timeout=60, context=_SSL_CTX) as r:
+                return json.loads(r.read().decode("utf-8"))
+        raise
+
+
+def _ensure_feedback_branch():
+    """Create the attachments branch off the default branch when missing."""
+    base = f"https://api.github.com/repos/{FEEDBACK_REPO}"
+    try:
+        _github_api_json(f"{base}/git/ref/heads/{FEEDBACK_BRANCH}")
+        return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    default = _github_api_json(base).get("default_branch") or "main"
+    head = _github_api_json(f"{base}/git/ref/heads/{default}")
+    _github_api_json(f"{base}/git/refs", method="POST", payload={
+        "ref": f"refs/heads/{FEEDBACK_BRANCH}",
+        "sha": head["object"]["sha"],
+    })
+
+
+def upload_feedback_attachment(path: str, stamp: str) -> str:
+    """Commit one screenshot to the feedback branch; return its GitHub URL."""
+    import base64
+    fn = re.sub(r"[^\w.\-]+", "_", os.path.basename(path)) or "attachment"
+    with open(path, "rb") as f:
+        blob = f.read()
+    dest = f"feedback_attachments/{stamp}/{fn}"
+    url = (f"https://api.github.com/repos/{FEEDBACK_REPO}/contents/"
+           + urllib.parse.quote(dest))
+    resp = _github_api_json(url, method="PUT", payload={
+        "message": f"Feedback attachment ({stamp})",
+        "content": base64.b64encode(blob).decode("ascii"),
+        "branch": FEEDBACK_BRANCH,
+    })
+    return (resp.get("content") or {}).get("html_url") or (
+        f"https://github.com/{FEEDBACK_REPO}/blob/{FEEDBACK_BRANCH}/{dest}")
+
+
+def create_feedback_issue(title: str, body: str, label: str) -> str:
+    """Open a GitHub issue on the feedback repo; return its URL."""
+    resp = _github_api_json(
+        f"https://api.github.com/repos/{FEEDBACK_REPO}/issues",
+        method="POST",
+        payload={"title": title, "body": body,
+                 "labels": [label, "in-app-feedback"]})
+    return resp.get("html_url", "")
+
+
+def save_feedback_locally(kind: str, sender: str, message: str,
+                          attachments: List[str]) -> str:
+    """Offline / no-token fallback: bundle the feedback into feedback_outbox/
+    so the user can send the folder to the developer manually."""
+    import datetime
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = os.path.join(SCRIPT_DIR, "feedback_outbox", stamp)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "message.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Type: {kind}\n"
+                f"From: {sender or '(not given)'}\n"
+                f"App:  v{APP_VERSION} · {sys.platform} · "
+                f"Python {sys.version.split()[0]}\n"
+                f"Date: {stamp}\n\n{message}\n")
+    for p in attachments:
+        try:
+            shutil.copy2(p, os.path.join(folder, os.path.basename(p)))
+        except OSError:
+            pass
+    return folder
 
 
 # ─── Per-file output folder helper ──────────────────────────────────────────
@@ -1927,7 +2039,7 @@ def _load_lang_prompt(stage: str, language: str) -> str:
 
 def _run_gemini_pipeline(formatted_srt: str, model: str = GEMINI_DEFAULT_MODEL,
                          language: str = TTS_DEFAULT_LANGUAGE,
-                         steps: int = 3):
+                         steps: int = 3, tm_glossary: str = ""):
     """Runs translation (→ review → punctuation) on the configured LLM provider.
 
     *steps* selects the prompt chain depth:
@@ -1938,11 +2050,16 @@ def _run_gemini_pipeline(formatted_srt: str, model: str = GEMINI_DEFAULT_MODEL,
 
     Prompt files are sent as the static prefix of each request so they get
     prompt-cached across audios (see _llm_generate).
+    *tm_glossary* (optional) is a translation-memory block of previously
+    approved translations, appended to the Step-1 dynamic input so proofed
+    phrasing is reused for consistency.
     Returns (translation, review, punctuation, tr_input, rev_input, punc_input)."""
     steps = max(1, min(3, int(steps or 3)))
 
     p1 = _load_lang_prompt("Step1_Translation_Prompt", language)
     tr_dyn     = f"\n\n=== Formatted SRT Content ===\n{formatted_srt}"
+    if tm_glossary:
+        tr_dyn += tm_glossary
     tr_input   = p1 + tr_dyn
     tr_result  = _llm_generate(tr_dyn, model, static_prefix=p1)
 
@@ -2048,6 +2165,86 @@ def _pair_review_rows(en_entries: List[Tuple[float, float, str]],
                      en[i][0], en[j - 1][1]))
         i = j
     return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Translation memory (feedback loop) helpers
+#
+#  Capture: when the user clicks "Continue to Dubbing" in the review window,
+#  the reviewed script is human-proofed — store it (full + row pairs).
+#  Reuse: before calling the LLM, an exact English match returns the proofed
+#  script for zero tokens; partial matches are injected into the translation
+#  prompt as approved reference translations.
+#  All helpers are no-ops when translation_memory.py is missing, and they
+#  never raise into the pipeline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tm_lang(language: str) -> str:
+    """Normalized language key used across store/lookup."""
+    return (language or "").strip().lower()
+
+
+def _tm_source_text(en_entries: List[Tuple[float, float, str]]) -> str:
+    """Timing-independent English key: the segment texts joined in order.
+    (Hashing the formatted SRT would bake in timings/syllable metrics that
+    drift between transcription runs of the same audio.)"""
+    return " ".join(t.strip() for (_s0, _s1, t) in en_entries if t and t.strip())
+
+
+def _tm_lookup_full(language: str, en_entries) -> Optional[str]:
+    """Proofed full script for this exact English content, or None."""
+    if translation_memory is None:
+        return None
+    src = _tm_source_text(en_entries)
+    if not src:
+        return None
+    try:
+        return translation_memory.lookup_full(_tm_lang(language), src)
+    except Exception:
+        return None
+
+
+def _tm_glossary_block(language: str, en_entries, cap: int = 40) -> str:
+    """Prompt block of previously approved translations found in this source.
+    Empty string when there are none (or memory is unavailable)."""
+    if translation_memory is None:
+        return ""
+    src = _tm_source_text(en_entries)
+    if not src:
+        return ""
+    try:
+        pairs = translation_memory.lookup_pairs_in_source(
+            _tm_lang(language), src, cap=cap)
+    except Exception:
+        return ""
+    if not pairs:
+        return ""
+    lines = [f"English: {en}\n{language}: {tr}" for en, tr in pairs]
+    return ("\n\n=== Previously approved translations "
+            "(reuse these verbatim wherever the same English appears) ===\n"
+            + "\n\n".join(lines))
+
+
+def _tm_capture(language: str, en_entries, proofed_text: str,
+                source: str = "") -> int:
+    """Store a human-reviewed script: full doc + review-row pairs.
+    Returns the number of pairs stored (0 when memory is unavailable)."""
+    if translation_memory is None:
+        return 0
+    src = _tm_source_text(en_entries)
+    proofed_text = (proofed_text or "").strip()
+    if not proofed_text:
+        return 0
+    lang = _tm_lang(language)
+    try:
+        if src:
+            translation_memory.store_full(lang, src, proofed_text, source)
+        rows = _pair_review_rows(
+            en_entries, _split_translation_paragraphs(proofed_text))
+        pairs = [(en, tr) for (en, tr, _s0, _s1) in rows if en and tr]
+        return translation_memory.store_pairs(lang, pairs, source) or 0
+    except Exception:
+        return 0
 
 
 def _run_emotion_enrichment(text: str,
@@ -3374,6 +3571,12 @@ class EndToEndApp:
         # Skip / Continue buttons.
         self._review_enabled_var = tk.BooleanVar(value=True)
 
+        # Translation memory (feedback loop). When on: an exact English
+        # match reuses the human-proofed script with zero LLM cost, partial
+        # matches are injected into the translation prompt, and reviewed
+        # scripts are captured back into memory on "Continue to Dubbing".
+        self._tm_enabled_var = tk.BooleanVar(value=True)
+
         # ── Audio Syncing tab state ──────────────────────────────────────────
         # Two independent waveform panels (English + Bengali). Each "side"
         # holds its own audio data, sample rate, duration, file path,
@@ -4649,6 +4852,13 @@ class EndToEndApp:
                   cursor="hand2", relief="flat", padx=8,
                   ).pack(side="left", padx=(6, 0), pady=4)
 
+        tk.Button(model_row, text="💬 Send Feedback",
+                  command=self._open_feedback_dialog,
+                  bg=PANEL, fg=_btn_fg(TEXT), activebackground=PANEL3,
+                  activeforeground=_btn_fg(ACCENT), font=(MONO_FONT, 9),
+                  cursor="hand2", relief="flat", padx=8,
+                  ).pack(side="left", padx=(6, 0), pady=4)
+
         # ── Options row (own row so nothing clips off the right edge) ─────────
         opts_row = tk.Frame(tp, bg=PANEL3, height=34)
         opts_row.pack(fill="x")
@@ -4683,6 +4893,15 @@ class EndToEndApp:
             activebackground=PANEL3, activeforeground=ACCENT,
             font=(MONO_FONT, 9), cursor="hand2",
         ).pack(side="left", padx=(0, 6), pady=6)
+
+        if translation_memory is not None:
+            tk.Checkbutton(
+                opts_row, text="Translation memory",
+                variable=self._tm_enabled_var,
+                bg=PANEL3, fg=TEXT, selectcolor=PANEL,
+                activebackground=PANEL3, activeforeground=ACCENT,
+                font=(MONO_FONT, 9), cursor="hand2",
+            ).pack(side="left", padx=(0, 6), pady=6)
 
     # ── LLM provider settings dialog ─────────────────────────────────────────
 
@@ -4739,6 +4958,198 @@ class EndToEndApp:
                 f"Backups of replaced files: {backup}\n\n"
                 "Please close and reopen the app to use the new version."))
         threading.Thread(target=worker, daemon=True).start()
+
+    # ── Feedback dialog (message + screenshots → GitHub issue) ───────────
+    def _open_feedback_dialog(self):
+        """Collect a message + optional screenshots and file them as a
+        GitHub issue on the app repo. Falls back to saving the feedback
+        into feedback_outbox/ when GitHub can't be reached."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Send Feedback")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        tk.Label(dlg, text="Share feedback, ideas or bug reports",
+                 bg=PANEL, fg=TEXT, font=(MONO_FONT, 11, "bold")
+                 ).pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(dlg, text="Sent straight to the developer — screenshots welcome.",
+                 bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9)
+                 ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        kind_var = tk.StringVar(value="Feedback")
+        kind_row = tk.Frame(dlg, bg=PANEL)
+        kind_row.pack(anchor="w", padx=14)
+        for label in ("💬 Feedback", "💡 Improvement", "🐞 Bug"):
+            tk.Radiobutton(
+                kind_row, text=label, variable=kind_var,
+                value=label.split(" ", 1)[1],
+                bg=PANEL, fg=TEXT, selectcolor=PANEL3,
+                activebackground=PANEL, activeforeground=ACCENT,
+                font=(MONO_FONT, 9), cursor="hand2",
+            ).pack(side="left", padx=(0, 12))
+
+        name_row = tk.Frame(dlg, bg=PANEL)
+        name_row.pack(fill="x", padx=14, pady=(8, 0))
+        tk.Label(name_row, text="Your name (optional):", bg=PANEL,
+                 fg=TEXT_FAINT, font=(MONO_FONT, 9)).pack(side="left")
+        name_entry = tk.Entry(name_row, bg=INPUT_BG, fg=INPUT_FG,
+                              font=(MONO_FONT, 9), width=28, relief="flat")
+        name_entry.pack(side="left", padx=(6, 0), ipady=2)
+
+        msg_box = scrolledtext.ScrolledText(
+            dlg, bg=PANEL3, fg=TEXT, insertbackground=TEXT,
+            font=(MONO_FONT, 10), wrap="word", width=64, height=9)
+        msg_box.pack(fill="both", expand=True, padx=14, pady=(8, 4))
+        msg_box.focus_set()
+
+        attachments: List[str] = []
+        attach_lbl = tk.Label(dlg, text="No screenshots attached.", bg=PANEL,
+                              fg=TEXT_FAINT, font=(MONO_FONT, 8),
+                              anchor="w", justify="left")
+
+        def _refresh_attach_label():
+            if attachments:
+                names = ", ".join(os.path.basename(p) for p in attachments)
+                attach_lbl.config(text=f"Attached: {names}")
+            else:
+                attach_lbl.config(text="No screenshots attached.")
+
+        def _add_attachments():
+            paths = filedialog.askopenfilenames(
+                parent=dlg, title="Attach screenshot(s)",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp"),
+                           ("All files", "*.*")])
+            for p in paths:
+                try:
+                    mb = os.path.getsize(p) / (1024 * 1024)
+                except OSError:
+                    continue
+                if mb > FEEDBACK_MAX_ATTACHMENT_MB:
+                    messagebox.showwarning(
+                        "File Too Large",
+                        f"{os.path.basename(p)} is {mb:.0f} MB — the limit "
+                        f"is {FEEDBACK_MAX_ATTACHMENT_MB} MB per file.",
+                        parent=dlg)
+                    continue
+                if p not in attachments:
+                    attachments.append(p)
+            _refresh_attach_label()
+
+        def _clear_attachments():
+            attachments.clear()
+            _refresh_attach_label()
+
+        attach_row = tk.Frame(dlg, bg=PANEL)
+        attach_row.pack(fill="x", padx=14)
+        tk.Button(attach_row, text="📎 Attach Screenshot(s)",
+                  command=_add_attachments,
+                  bg=PANEL3, fg=_btn_fg(TEXT), activebackground=PANEL3,
+                  activeforeground=_btn_fg(ACCENT), font=(MONO_FONT, 9),
+                  cursor="hand2", relief="flat", padx=8,
+                  ).pack(side="left", pady=2)
+        tk.Button(attach_row, text="Clear", command=_clear_attachments,
+                  bg=PANEL3, fg=_btn_fg(TEXT), activebackground=PANEL3,
+                  activeforeground=_btn_fg(ACCENT), font=(MONO_FONT, 9),
+                  cursor="hand2", relief="flat", padx=8,
+                  ).pack(side="left", padx=(6, 0), pady=2)
+        attach_lbl.pack(fill="x", padx=14, pady=(2, 0))
+
+        status_lbl = tk.Label(dlg, text="", bg=PANEL, fg=TEXT_FAINT,
+                              font=(MONO_FONT, 9), anchor="w")
+        status_lbl.pack(fill="x", padx=14, pady=(4, 0))
+
+        btn_row = tk.Frame(dlg, bg=PANEL)
+        btn_row.pack(fill="x", padx=14, pady=(6, 12))
+        send_btn = tk.Button(
+            btn_row, text="Send  ➤",
+            bg="#2563eb", fg=_btn_fg("white"), activebackground=PANEL3,
+            activeforeground=_btn_fg(ACCENT), font=(MONO_FONT, 9, "bold"),
+            cursor="hand2", relief="flat", padx=14)
+        send_btn.pack(side="right")
+        tk.Button(btn_row, text="Cancel", command=dlg.destroy,
+                  bg=PANEL3, fg=_btn_fg(TEXT), activebackground=PANEL3,
+                  activeforeground=_btn_fg(ACCENT), font=(MONO_FONT, 9),
+                  cursor="hand2", relief="flat", padx=10,
+                  ).pack(side="right", padx=(0, 8))
+
+        def _send():
+            message = msg_box.get("1.0", "end").strip()
+            if not message:
+                messagebox.showwarning("Empty Message",
+                                       "Please write a message first.",
+                                       parent=dlg)
+                return
+            send_btn.config(state="disabled")
+            status_lbl.config(text="Sending…")
+            kind = kind_var.get()
+            sender = name_entry.get().strip()
+            files = list(attachments)
+            threading.Thread(
+                target=self._submit_feedback,
+                args=(dlg, send_btn, status_lbl, kind, sender, message, files),
+                daemon=True).start()
+
+        send_btn.config(command=_send)
+
+    def _submit_feedback(self, dlg, send_btn, status_lbl,
+                         kind, sender, message, files):
+        """Background worker: upload screenshots, open the GitHub issue.
+        All UI updates go through root.after()."""
+        import datetime
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            links = []
+            if files:
+                self.root.after(0, lambda: status_lbl.config(
+                    text="Uploading screenshots…"))
+                _ensure_feedback_branch()
+                for p in files:
+                    links.append((os.path.basename(p),
+                                  upload_feedback_attachment(p, stamp)))
+            self.root.after(0, lambda: status_lbl.config(
+                text="Creating report…"))
+            first_line = message.strip().splitlines()[0][:60]
+            title = f"[{kind}] {first_line}"
+            body = (f"**Type:** {kind}\n"
+                    f"**From:** {sender or '(not given)'}\n"
+                    f"**App:** v{APP_VERSION} · {sys.platform} · "
+                    f"Python {sys.version.split()[0]}\n\n---\n\n{message}\n")
+            if links:
+                body += "\n---\n\n**Screenshots:**\n" + "\n".join(
+                    f"- [{name}]({url})" for name, url in links)
+            issue_url = create_feedback_issue(title, body,
+                                              label=kind.lower())
+
+            def _done():
+                dlg.destroy()
+                messagebox.showinfo(
+                    "Feedback Sent",
+                    "Thank you! Your feedback was delivered to the "
+                    "developer.\n\n" + (f"Reference: {issue_url}"
+                                        if issue_url else ""))
+            self.root.after(0, _done)
+        except Exception as e:
+            err = str(e)
+            folder = ""
+            try:
+                folder = save_feedback_locally(kind, sender, message, files)
+            except OSError:
+                pass
+
+            def _failed():
+                send_btn.config(state="normal")
+                status_lbl.config(text="")
+                hint = ("Sending needs the github_token.txt file next to the "
+                        "app (the same one used for updates) and an internet "
+                        "connection.")
+                saved = (f"\n\nYour feedback was saved to:\n{folder}\n"
+                         "You can send that folder to the developer manually."
+                         if folder else "")
+                messagebox.showerror(
+                    "Could Not Send Feedback",
+                    f"{hint}\n\nDetails: {err}{saved}", parent=dlg)
+            self.root.after(0, _failed)
 
     def _open_llm_settings_dialog(self):
         """Modal dialog: pick provider (Vertex JSON / Gemini key / OpenAI base
@@ -5752,12 +6163,21 @@ class EndToEndApp:
                 tr_paras = _split_translation_paragraphs(script_text)
                 self.root.after(0, lambda: self._show_translation_review(
                     en_entries, tr_paras, language, res, done,
-                    audio=y_data, sr=sr))
+                    audio=y_data, sr=sr, audio_path=audio_path))
                 done.wait()
                 new_text = script_text
                 if (res.get("action") == "continue"
                         and (res.get("text") or "").strip()):
                     new_text = res["text"].strip()
+                    # Feedback loop: reviewed re-dub script is human-proofed —
+                    # save to translation memory (same capture as the
+                    # single-file review).
+                    if self._tm_enabled_var.get():
+                        n_pairs = _tm_capture(language, en_entries, new_text,
+                                              source=base)
+                        if n_pairs:
+                            _st(f"🧠 Proofed translation saved to memory "
+                                f"({n_pairs} pairs).")
 
                 rev = _history_next_redub_rev(outdir)
 
@@ -6677,17 +7097,19 @@ class EndToEndApp:
     # ─────────────────────────────────────────────────────────────────────────
     def _show_translation_review(self, en_entries, tr_paragraphs, language,
                                  result_holder, done_event,
-                                 audio=None, sr=None):
+                                 audio=None, sr=None, audio_path=None):
         """
         Modal side-by-side review of the translation before dubbing.
 
-        Left column: the English transcription (read-only, no timecodes),
-        grouped via _pair_review_rows so each box faces its corresponding
-        translation paragraph. Right column: the translation paragraphs
-        (editable). When *audio* (numpy array) and *sr* are given, each row
-        gets a ▶ button that plays that row's slice of the English audio
-        with a karaoke-style sweep over the text. Must be called on the Tk
-        main thread; the pipeline worker blocks on *done_event*.
+        Left pane: the full English transcription in one read-only box.
+        Right pane: the full translation in one editable box. When *audio*
+        (numpy array) and *sr* are given, a Play/Pause/Stop bar plays the
+        whole English audio in one go, highlighting the segment currently
+        being spoken (double-click a paragraph to jump there). A video file
+        can be imported into a third pane; it plays muted, frame-synced to
+        the same clock, so the pipeline audio is the soundtrack. Must be
+        called on the Tk main thread; the pipeline worker blocks on
+        *done_event*.
 
         Fills *result_holder* with:
             action — "skip" (dub the script unchanged) or
@@ -6732,9 +7154,9 @@ class EndToEndApp:
                  fg=TR_ACCENT, font=(MONO_FONT, 10, "bold")
                  ).pack(side="left", padx=14, pady=12)
         tk.Label(hdr,
-                 text=f"English is read-only — edit the {language} boxes if "
-                      "needed, then Continue. Skip dubs the script unchanged. "
-                      "(Row pairing is approximate.)",
+                 text=f"English is read-only — edit the {language} text on "
+                      "the right, then Continue. Skip dubs the script "
+                      "unchanged.",
                  bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9)
                  ).pack(side="left", padx=8)
 
@@ -6752,195 +7174,477 @@ class EndToEndApp:
 
         has_audio = audio is not None and sr
 
-        # ── Column headers ────────────────────────────────────────────────
-        cols = tk.Frame(win, bg=BG)
-        cols.pack(fill="x", padx=14, pady=(8, 0))
-        cols.columnconfigure(0, minsize=PLAY_COL_W if has_audio else 0)
-        cols.columnconfigure(1, weight=1, uniform="rev")
-        cols.columnconfigure(2, weight=1, uniform="rev")
-        tk.Label(cols, text="ENGLISH TRANSCRIPTION"
-                 + ("  (▶ = hear it)" if has_audio else ""),
-                 bg=BG, fg=REG_LABEL,
-                 font=(MONO_FONT, 9, "bold"), anchor="w"
-                 ).grid(row=0, column=1, sticky="w")
-        tk.Label(cols, text=f"{lang_up} TRANSLATION (editable)", bg=BG,
-                 fg=ACCENT, font=(MONO_FONT, 9, "bold"), anchor="w"
-                 ).grid(row=0, column=2, sticky="w", padx=(10, 0))
-
-        # ── Scrollable paired boxes ───────────────────────────────────────
-        mid = tk.Frame(win, bg=BG)
-        mid.pack(fill="both", expand=True, padx=14, pady=6)
-
-        canvas = tk.Canvas(mid, bg=BG, highlightthickness=0)
-        vsb = ttk.Scrollbar(mid, orient="vertical", command=canvas.yview,
-                            style="Vertical.TScrollbar")
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = tk.Frame(canvas, bg=BG)
-        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.columnconfigure(0, minsize=PLAY_COL_W if has_audio else 0)
-        inner.columnconfigure(1, weight=1, uniform="rev")
-        inner.columnconfigure(2, weight=1, uniform="rev")
-
-        inner.bind("<Configure>", lambda _e:
-                   canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e:
-                    canvas.itemconfigure(inner_id, width=e.width))
-
-        def _on_wheel(event):
-            if getattr(event, "num", None) == 4:      # X11 wheel up
-                step = -1
-            elif getattr(event, "num", None) == 5:    # X11 wheel down
-                step = 1
-            elif IS_MAC:
-                step = -event.delta
-            else:                                     # Windows: ±120 per notch
-                step = -event.delta // 120
-            canvas.yview_scroll(int(step), "units")
-            return "break"
-
-        def _bind_wheel(w):
-            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                w.bind(seq, _on_wheel)
-
-        for w in (canvas, inner):
-            _bind_wheel(w)
-
         rows = (_pair_review_rows(en_entries, tr_paragraphs)
                 or [("", "", None, None)])
 
-        # ── Per-row playback of the English audio ─────────────────────────
-        # play_state: r = playing row index, after_id = pending sweep tick.
-        play_state = {"r": None, "after_id": None, "t0": 0.0}
-        en_boxes, tr_boxes, play_btns = [], [], []
+        # ── Playback / video toolbar (widgets created after the panes) ────
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=14, pady=(8, 0))
 
-        def _stop_play(reset_ui=True):
+        # ── Full-width panes: [video] | English | translation ────────────
+        paned = tk.PanedWindow(win, orient="horizontal", bg=BG,
+                               sashwidth=6, bd=0, relief="flat")
+        paned.pack(fill="both", expand=True, padx=14, pady=6)
+
+        def _make_pane(title, fg):
+            holder = tk.Frame(paned, bg=BG)
+            tk.Label(holder, text=title, bg=BG, fg=fg,
+                     font=(MONO_FONT, 9, "bold"), anchor="w"
+                     ).pack(fill="x", pady=(0, 4))
+            body = tk.Frame(holder, bg=BG)
+            body.pack(fill="both", expand=True)
+            return holder, body
+
+        # Video pane — built up-front but only added to the PanedWindow
+        # once a video is imported.
+        vid_holder, vid_body = _make_pane(
+            "VIDEO  (muted — pipeline audio is the soundtrack)", REG_LABEL)
+        vid_name = tk.Label(vid_holder, text="", bg=BG, fg=TEXT_FAINT,
+                            font=(MONO_FONT, 8), anchor="w")
+        vid_name.pack(fill="x", side="bottom")
+        vid_lbl = tk.Label(vid_body, bg="black", anchor="center")
+        vid_lbl.pack(fill="both", expand=True)
+
+        en_holder, en_body = _make_pane(
+            "ENGLISH TRANSCRIPTION"
+            + ("  (double-click a paragraph to play from it)"
+               if has_audio else ""),
+            REG_LABEL)
+        en_box = tk.Text(en_body, wrap="word", bg=PANEL2, fg=TEXT,
+                         relief="flat", bd=0, padx=10, pady=8,
+                         font=(MONO_FONT, 10), highlightthickness=1,
+                         highlightbackground=PANEL_BORDER)
+        en_vsb = ttk.Scrollbar(en_body, orient="vertical",
+                               command=en_box.yview,
+                               style="Vertical.TScrollbar")
+        en_box.configure(yscrollcommand=en_vsb.set)
+        en_vsb.pack(side="right", fill="y")
+        en_box.pack(side="left", fill="both", expand=True)
+
+        tr_holder, tr_body = _make_pane(
+            f"{lang_up} TRANSLATION (editable)", ACCENT)
+        tr_box = tk.Text(tr_body, wrap="word", bg=INPUT_BG, fg=INPUT_FG,
+                         insertbackground=INPUT_FG, relief="flat", bd=0,
+                         padx=10, pady=8, font=(MONO_FONT, 11),
+                         highlightthickness=1,
+                         highlightbackground=PANEL_BORDER, undo=True)
+        tr_vsb = ttk.Scrollbar(tr_body, orient="vertical",
+                               command=tr_box.yview,
+                               style="Vertical.TScrollbar")
+        tr_box.configure(yscrollcommand=tr_vsb.set)
+        tr_vsb.pack(side="right", fill="y")
+        tr_box.pack(side="left", fill="both", expand=True)
+
+        paned.add(en_holder, stretch="always", minsize=240)
+        paned.add(tr_holder, stretch="always", minsize=240)
+
+        # Fill the English pane, remembering each segment's char range so
+        # playback can highlight the paragraph currently being spoken.
+        seg_ranges = []          # (char_start, char_end, seg_start, seg_end)
+        ofs = 0
+        for i, (en_txt, _tr_txt, seg_s, seg_e) in enumerate(rows):
+            if i:
+                en_box.insert("end", "\n\n")
+                ofs += 2
+            en_box.insert("end", en_txt)
+            seg_ranges.append((ofs, ofs + len(en_txt), seg_s, seg_e))
+            ofs += len(en_txt)
+        en_box.tag_configure("curseg", background="#1e3a8a",
+                             foreground="#f8fafc")
+        en_box.config(state="disabled")
+
+        tr_box.insert("1.0", "\n\n".join(r[1] for r in rows if r[1]))
+        tr_box.edit_reset()
+
+        # ── One clock drives audio, segment highlight and video frames ────
+        play = {"on": False, "pos": 0.0, "t0": 0.0, "after": None}
+        vid = {"cap": None, "cv2": None, "fps": 25.0, "frames": 0,
+               "last": -1, "photo": None, "offset": 0.0}
+        mute_var = tk.BooleanVar(value=False)
+        seek_var = tk.DoubleVar(value=0.0)   # 0..1000 across the timeline
+        seek_drag = {"on": False}      # user dragging the seek slider
+
+        def _total_dur():
+            if has_audio:
+                return len(audio) / float(sr)
+            if vid["cap"] is not None and vid["fps"]:
+                return vid["frames"] / vid["fps"]
+            return 0.0
+
+        def _cur_t():
+            if play["on"]:
+                return play["pos"] + (time.perf_counter() - play["t0"])
+            return play["pos"]
+
+        def _fmt_t(t):
+            t = max(0, int(t))
+            return f"{t // 60:02d}:{t % 60:02d}"
+
+        def _update_time():
+            t, total = _cur_t(), _total_dur()
+            time_lbl.config(text=f"{_fmt_t(t)} / {_fmt_t(total)}")
+            # Reflect playback position on the slider, but never fight the
+            # user while they are dragging it.
+            if not seek_drag["on"]:
+                seek_var.set((t / total * 1000.0) if total > 0 else 0.0)
+
+        def _cancel_tick():
+            if play["after"] is not None:
+                try:
+                    win.after_cancel(play["after"])
+                except Exception:
+                    pass
+                play["after"] = None
+
+        def _highlight_seg(t):
+            en_box.tag_remove("curseg", "1.0", "end")
+            for cs, ce, s, e in seg_ranges:
+                if s is not None and e is not None and s <= t < e:
+                    i0, i1 = f"1.0 + {cs} chars", f"1.0 + {ce} chars"
+                    en_box.tag_add("curseg", i0, i1)
+                    en_box.see(i1)
+                    en_box.see(i0)
+                    break
+
+        def _video_show(t):
+            cap, cv2 = vid["cap"], vid["cv2"]
+            if cap is None:
+                return
+            fps = vid["fps"] or 25.0
+            idx = int((t + vid["offset"]) * fps)
+            idx = max(0, idx)
+            if vid["frames"]:
+                idx = min(idx, vid["frames"] - 1)
+            if idx == vid["last"]:
+                return
+            # Rewind or big forward jump → hard seek; otherwise read through.
+            if idx < vid["last"] or idx - vid["last"] > fps * 2:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                vid["last"] = idx - 1
+            frame = None
+            while vid["last"] < idx:
+                ok, frame = cap.read()
+                if not ok:
+                    return
+                vid["last"] += 1
+            if frame is None:
+                return
+            maxw = vid_lbl.winfo_width()
+            maxh = vid_lbl.winfo_height()
+            maxw = maxw - 8 if maxw > 60 else 420
+            maxh = maxh - 8 if maxh > 60 else 320
+            h, w = frame.shape[:2]
+            k = min(maxw / w, maxh / h)
+            if k < 1.0:
+                frame = cv2.resize(
+                    frame, (max(1, int(w * k)), max(1, int(h * k))),
+                    interpolation=cv2.INTER_AREA)
+            ppm = (b"P6 %d %d 255\n" % (frame.shape[1], frame.shape[0])
+                   + frame[:, :, ::-1].tobytes())
+            try:
+                photo = tk.PhotoImage(data=ppm)
+            except Exception:
+                return
+            vid["photo"] = photo        # keep a reference or tk drops it
+            vid_lbl.config(image=photo)
+
+        def _tick():
+            play["after"] = None
+            t, total = _cur_t(), _total_dur()
+            if total and t >= total:
+                _pause()
+                play["pos"] = total
+                _update_time()
+                return
+            _update_time()
+            _highlight_seg(t)
+            _video_show(t)
+            if play["on"]:
+                play["after"] = win.after(80, _tick)
+
+        def _audio_start(t):
+            if not has_audio or mute_var.get():
+                return
+            i0 = int(t * sr)
+            if i0 >= len(audio):
+                return
+            try:
+                sd.play(audio[i0:].astype(np.float32), samplerate=sr)
+            except Exception as e:
+                status_lbl.config(text=f"Playback error: {e}", fg="#f87171")
+
+        def _play():
+            if play["on"] or _total_dur() <= 0:
+                return
+            if play["pos"] >= _total_dur():
+                play["pos"] = 0.0
+            _audio_start(play["pos"])
+            play["on"] = True
+            play["t0"] = time.perf_counter()
+            play_btn.config(text="⏸ Pause")
+            _tick()
+
+        def _pause():
+            if play["on"]:
+                play["pos"] = _cur_t()
+            play["on"] = False
             try:
                 sd.stop()
             except Exception:
                 pass
-            if play_state["after_id"] is not None:
-                try:
-                    win.after_cancel(play_state["after_id"])
-                except Exception:
-                    pass
-                play_state["after_id"] = None
-            r = play_state["r"]
-            play_state["r"] = None
-            if reset_ui and r is not None:
-                try:
-                    play_btns[r].config(text="▶", fg=_btn_fg(ACCENT))
-                    box = en_boxes[r]
-                    box.tag_remove("playpos", "1.0", "end")
-                    box.config(highlightbackground=PANEL_BORDER,
-                               highlightthickness=1)
-                except Exception:
-                    pass
+            _cancel_tick()
+            play_btn.config(text="▶ Play")
 
-        def _sweep_tick(r, dur, n_chars):
-            if play_state["r"] != r:
+        def _toggle_play():
+            (_pause if play["on"] else _play)()
+
+        def _stop_all():
+            _pause()
+            play["pos"] = 0.0
+            en_box.tag_remove("curseg", "1.0", "end")
+            _update_time()
+            _video_show(0.0)
+
+        def _seek(t):
+            was_on = play["on"]
+            _pause()
+            play["pos"] = max(0.0, t)
+            _update_time()
+            _highlight_seg(play["pos"])
+            _video_show(play["pos"])
+            if was_on:
+                _play()
+
+        def _skip(delta):
+            total = _total_dur()
+            if total <= 0:
                 return
-            elapsed = time.perf_counter() - play_state["t0"]
-            frac = min(1.0, elapsed / dur) if dur > 0 else 1.0
-            box = en_boxes[r]
+            _seek(min(total, max(0.0, _cur_t() + delta)))
+
+        # ── Seek slider (0..1000 maps to 0..total) ────────────────────────
+        def _seek_press(_e):
+            if _total_dur() <= 0:
+                return
+            seek_drag["on"] = True
+            seek_drag["was_on"] = play["on"]
+            if play["on"]:               # stop audio/tick; scrub silently
+                _pause()
+
+        def _seek_drag(_e):
+            # Live scrub while dragging: show the frame/time under the thumb.
+            if not seek_drag["on"]:
+                return
+            total = _total_dur()
+            if total <= 0:
+                return
+            t = seek_var.get() / 1000.0 * total
+            play["pos"] = t
+            time_lbl.config(text=f"{_fmt_t(t)} / {_fmt_t(total)}")
+            _highlight_seg(t)
+            _video_show(t)
+
+        def _seek_release(_e):
+            if not seek_drag["on"]:
+                return
+            seek_drag["on"] = False
+            total = _total_dur()
+            if total <= 0:
+                return
+            play["pos"] = seek_var.get() / 1000.0 * total
+            _update_time()
+            _highlight_seg(play["pos"])
+            _video_show(play["pos"])
+            if seek_drag.get("was_on"):
+                _play()
+
+        # ── Video sync offset — shift the video against the audio clock ───
+        def _nudge_video(delta):
+            vid["offset"] += delta
+            vid["last"] = -1          # force a reseek on the next frame
+            off_lbl.config(text=f"video {vid['offset']:+.2f}s")
+            _video_show(_cur_t())
+
+        def _reset_video_offset():
+            vid["offset"] = 0.0
+            vid["last"] = -1
+            off_lbl.config(text="video +0.00s")
+            _video_show(_cur_t())
+
+        def _on_en_dclick(event):
+            idx = en_box.index(f"@{event.x},{event.y}")
+            n = en_box.count("1.0", idx, "chars")
+            n = n[0] if n else 0
+            for cs, ce, s, _e in seg_ranges:
+                if cs <= n <= ce and s is not None:
+                    _seek(s)
+                    break
+            return "break"
+
+        if has_audio:
+            en_box.bind("<Double-Button-1>", _on_en_dclick)
+
+        def _on_mute():
+            if not play["on"]:
+                return
             try:
-                box.tag_remove("playpos", "1.0", "end")
-                box.tag_add("playpos", "1.0", f"1.0 + {int(frac * n_chars)} chars")
+                sd.stop()
             except Exception:
                 pass
-            if frac >= 1.0:
-                _stop_play()
-                return
-            play_state["after_id"] = win.after(
-                60, lambda: _sweep_tick(r, dur, n_chars))
+            if not mute_var.get():
+                _audio_start(_cur_t())
 
-        def _toggle_row_play(r):
-            if play_state["r"] == r:          # clicked the playing row → stop
-                _stop_play()
-                return
-            _stop_play()
-            t0, t1 = rows[r][2], rows[r][3]
-            if t0 is None or t1 is None or t1 <= t0:
-                return
-            seg = audio[int(t0 * sr):int(t1 * sr)]
-            if len(seg) == 0:
-                return
+        def _shutdown_media():
+            play["on"] = False
             try:
-                sd.play(seg.astype(np.float32), samplerate=sr)
-            except Exception as e:
-                status_lbl.config(text=f"Playback error: {e}", fg="#f87171")
+                sd.stop()
+            except Exception:
+                pass
+            _cancel_tick()
+            if vid["cap"] is not None:
+                try:
+                    vid["cap"].release()
+                except Exception:
+                    pass
+                vid["cap"] = None
+
+        # ── Video import / removal ────────────────────────────────────────
+        def _remove_video():
+            cap = vid["cap"]
+            vid.update(cap=None, last=-1, photo=None)
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            try:
+                paned.forget(vid_holder)
+            except Exception:
+                pass
+            vid_lbl.config(image="")
+            video_btn.config(text="🎬 Import Video…", command=_import_video)
+            try:
+                off_box.pack_forget()
+            except Exception:
+                pass
+            if not has_audio:
+                _stop_all()
+                play_btn.config(state="disabled")
+
+        def _import_video():
+            try:
+                import cv2
+            except ImportError:
+                messagebox.showwarning(
+                    "OpenCV required",
+                    "Video preview needs the opencv-python package.\n\n"
+                    "Install it with:\n\n    pip install opencv-python\n\n"
+                    "then import the video again.",
+                    parent=win)
                 return
-            play_state["r"] = r
-            play_state["t0"] = time.perf_counter()
-            play_btns[r].config(text="⏹", fg=_btn_fg("#f87171"))
-            en_boxes[r].config(highlightbackground=ACCENT, highlightthickness=2)
-            _sweep_tick(r, t1 - t0, len(rows[r][0]))
+            initdir = (os.path.dirname(os.path.abspath(audio_path))
+                       if audio_path else os.path.expanduser("~"))
+            path = filedialog.askopenfilename(
+                parent=win, title="Import video",
+                initialdir=initdir,
+                filetypes=[("Video files",
+                            "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
+                           ("All files", "*.*")])
+            if not path:
+                return
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                messagebox.showerror(
+                    "Video", "Could not open this video file.", parent=win)
+                return
+            _remove_video()
+            vid.update(cap=cap, cv2=cv2,
+                       fps=cap.get(cv2.CAP_PROP_FPS) or 25.0,
+                       frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
+                       last=-1, offset=0.0)
+            off_lbl.config(text="video +0.00s")
+            vid_name.config(text=os.path.basename(path))
+            paned.add(vid_holder, before=en_holder, stretch="always",
+                      width=430, minsize=240)
+            video_btn.config(text="✕ Remove Video", command=_remove_video)
+            off_box.pack(side="right", padx=(0, 10))
+            play_btn.config(state="normal")
+            win.after(80, lambda: _video_show(_cur_t()))
 
-        for i, (en_txt, tr_txt, seg_s, seg_e) in enumerate(rows):
-            # Shared row height so the pair stays visually aligned.
-            est = max(len(en_txt), len(tr_txt)) // 45 + 1 + tr_txt.count("\n")
-            h = max(2, min(14, est))
+        # ── Toolbar: row 1 = seek slider, row 2 = transport controls ──────
+        seek_row = tk.Frame(bar, bg=BG)
+        seek_row.pack(fill="x")
+        ctrl_row = tk.Frame(bar, bg=BG)
+        ctrl_row.pack(fill="x", pady=(4, 0))
 
-            if has_audio:
-                can_play = seg_s is not None and seg_e is not None
-                btn = tk.Button(inner, text="▶" if can_play else " ",
-                                command=(lambda r=i: _toggle_row_play(r)),
-                                state="normal" if can_play else "disabled",
-                                bg=PANEL, fg=_btn_fg(ACCENT),
-                                activebackground=PANEL3,
-                                activeforeground=_btn_fg(ACCENT),
-                                font=(MONO_FONT, 10), relief="flat",
-                                cursor="hand2" if can_play else "arrow",
-                                width=2, bd=0)
-                btn.grid(row=i, column=0, sticky="n", padx=(0, 4), pady=3)
-                play_btns.append(btn)
-            else:
-                play_btns.append(None)
+        seek = ttk.Scale(seek_row, from_=0, to=1000, orient="horizontal",
+                         variable=seek_var, command=lambda _v: None,
+                         style="Horizontal.TScale",
+                         state="normal" if has_audio else "disabled")
+        seek.pack(fill="x", expand=True)
+        seek.bind("<ButtonPress-1>", _seek_press)
+        seek.bind("<B1-Motion>", _seek_drag)
+        seek.bind("<ButtonRelease-1>", _seek_release)
 
-            en_box = tk.Text(inner, height=h, wrap="word", bg=PANEL2, fg=TEXT,
-                             relief="flat", bd=0, padx=8, pady=6,
-                             font=(MONO_FONT, 10), highlightthickness=1,
-                             highlightbackground=PANEL_BORDER)
-            en_box.insert("1.0", en_txt)
-            # Karaoke sweep highlight while this row's audio plays.
-            en_box.tag_configure("playpos", background="#1e3a8a",
-                                 foreground="#f8fafc")
-            en_box.config(state="disabled")
-            en_box.grid(row=i, column=1, sticky="nsew", padx=(0, 5), pady=3)
-            en_boxes.append(en_box)
+        def _tbtn(parent, label, cmd, bold=False, accent=False, **kw):
+            return tk.Button(parent, text=label, command=cmd,
+                             bg=PANEL3,
+                             fg=_btn_fg(ACCENT if accent else TEXT),
+                             activebackground=PANEL3,
+                             activeforeground=_btn_fg(
+                                 ACCENT if accent else TEXT),
+                             font=(MONO_FONT, 10, "bold" if bold else
+                                   "normal"),
+                             relief="flat", cursor="hand2", bd=0, **kw)
 
-            tr_box = tk.Text(inner, height=h, wrap="word", bg=INPUT_BG,
-                             fg=INPUT_FG, insertbackground=INPUT_FG,
-                             relief="flat", bd=0, padx=8, pady=6,
-                             font=(MONO_FONT, 11), highlightthickness=1,
-                             highlightbackground=PANEL_BORDER)
-            tr_box.insert("1.0", tr_txt)
-            tr_box.grid(row=i, column=2, sticky="nsew", padx=(5, 0), pady=3)
-            tr_boxes.append(tr_box)
+        play_btn = _tbtn(ctrl_row, "▶ Play", _toggle_play, bold=True,
+                         accent=True, padx=12)
+        play_btn.config(state="normal" if has_audio else "disabled")
+        play_btn.pack(side="left")
+        _tbtn(ctrl_row, "⏹ Stop", _stop_all, padx=10).pack(
+            side="left", padx=(6, 0))
+        _tbtn(ctrl_row, "⏪ -5s", lambda: _skip(-5), padx=6).pack(
+            side="left", padx=(6, 0))
+        _tbtn(ctrl_row, "+5s ⏩", lambda: _skip(5), padx=6).pack(
+            side="left", padx=(4, 0))
+        time_lbl = tk.Label(ctrl_row, text="", bg=BG, fg=TEXT_FAINT,
+                            font=(MONO_FONT, 10))
+        time_lbl.pack(side="left", padx=12)
+        tk.Checkbutton(ctrl_row, text="🔇 Mute audio", variable=mute_var,
+                       command=_on_mute, bg=BG, fg=TEXT_FAINT,
+                       activebackground=BG, activeforeground=TEXT_FAINT,
+                       selectcolor=PANEL2,
+                       state="normal" if has_audio else "disabled",
+                       font=(MONO_FONT, 9)).pack(side="left", padx=4)
 
-            # Wheel anywhere scrolls the whole list, not one Text widget.
-            _bind_wheel(en_box)
-            _bind_wheel(tr_box)
+        video_btn = _tbtn(ctrl_row, "🎬 Import Video…", _import_video,
+                          padx=12)
+        video_btn.pack(side="right")
+
+        # Video sync-offset controls — hidden until a video is imported.
+        off_box = tk.Frame(ctrl_row, bg=BG)
+        _tbtn(off_box, "◀", lambda: _nudge_video(-0.10), padx=6).pack(
+            side="left")
+        off_lbl = tk.Label(off_box, text="video +0.00s", bg=BG,
+                           fg=TEXT_FAINT, font=(MONO_FONT, 9), width=13)
+        off_lbl.pack(side="left", padx=2)
+        _tbtn(off_box, "▶", lambda: _nudge_video(0.10), padx=6).pack(
+            side="left")
+        _tbtn(off_box, "⟲", _reset_video_offset, padx=6).pack(
+            side="left", padx=(4, 0))
+
+        _update_time()
 
         # ── Actions ───────────────────────────────────────────────────────
         def _gather_text():
-            paras = [b.get("1.0", "end-1c").strip() for b in tr_boxes]
-            return "\n\n".join(p for p in paras if p)
+            return tr_box.get("1.0", "end-1c").strip()
 
         def _copy(mode):
             if mode == "tr":
                 payload = _gather_text()
             else:
-                blocks = []
-                for i, b in enumerate(tr_boxes):
-                    en_txt = rows[i][0]
-                    tr_txt = b.get("1.0", "end-1c").strip()
-                    if not en_txt and not tr_txt:
-                        continue
-                    blocks.append(f"{en_txt}\n{tr_txt}".strip())
-                payload = "\n\n".join(blocks)
+                payload = (f"=== ENGLISH ===\n"
+                           f"{en_box.get('1.0', 'end-1c').strip()}\n\n"
+                           f"=== {lang_up} ===\n{_gather_text()}")
             win.clipboard_clear()
             win.clipboard_append(payload)
             status_lbl.config(text="✓ Copied to clipboard", fg=TR_ACCENT)
@@ -6948,7 +7652,7 @@ class EndToEndApp:
         def _finish(action):
             if done_event.is_set():
                 return
-            _stop_play(reset_ui=False)
+            _shutdown_media()
             result_holder["action"] = action
             if action == "continue":
                 txt = _gather_text()
@@ -6964,7 +7668,7 @@ class EndToEndApp:
         # must never leave the pipeline worker waiting forever.
         def _on_destroy(event):
             if event.widget is win and not done_event.is_set():
-                _stop_play(reset_ui=False)
+                _shutdown_media()
                 result_holder.setdefault("action", "skip")
                 done_event.set()
         win.bind("<Destroy>", _on_destroy)
@@ -7097,14 +7801,30 @@ class EndToEndApp:
                     self.root.after(0, _done_srt)
                     return
 
-                # Stage 1b: Gemini pipeline
+                # Stage 1b: Gemini pipeline (translation memory first — an
+                # exact proofed match skips the LLM entirely)
                 _chk()
-                self.root.after(0, lambda: self._set_stage("S1b", "Running LLM…", "#d97706"))
-                (tr_result, rev_result, punc_result,
-                 _, _, _) = _run_gemini_pipeline(formatted_srt,
-                                                  self._gemini_model_var.get(),
-                                                  language=pipeline_language,
-                                                  steps=self._translation_steps_var.get())
+                tm_on = self._tm_enabled_var.get()
+                en_entries_tm = _extract_srt_entries(final_srt)
+                tm_cached = (_tm_lookup_full(pipeline_language, en_entries_tm)
+                             if tm_on else None)
+                if tm_cached:
+                    tr_result = rev_result = punc_result = tm_cached
+                    self.root.after(0, lambda: self._set_stage(
+                        "S1b", "Reusing proofed translation…", "#22c55e"))
+                    self.root.after(0, lambda: self.status.config(
+                        text="🧠 Translation memory hit — reusing the "
+                             "human-proofed script (no LLM call)."))
+                else:
+                    self.root.after(0, lambda: self._set_stage("S1b", "Running LLM…", "#d97706"))
+                    tm_gloss = (_tm_glossary_block(pipeline_language, en_entries_tm)
+                                if tm_on else "")
+                    (tr_result, rev_result, punc_result,
+                     _, _, _) = _run_gemini_pipeline(formatted_srt,
+                                                      self._gemini_model_var.get(),
+                                                      language=pipeline_language,
+                                                      steps=self._translation_steps_var.get(),
+                                                      tm_glossary=tm_gloss)
 
                 # Save Step-1 Translation output (raw translation before review)
                 try:
@@ -7158,7 +7878,7 @@ class EndToEndApp:
                     self.root.after(0, lambda: self._show_translation_review(
                         en_entries, tr_paras, pipeline_language,
                         review_res, review_done,
-                        audio=y_data, sr=sr))
+                        audio=y_data, sr=sr, audio_path=filepath))
                     try:
                         while not review_done.wait(0.25):
                             _chk()
@@ -7180,6 +7900,17 @@ class EndToEndApp:
                             f.write(combined)
                         self.root.after(0, lambda p=punc_result: setattr(
                             self, "punctuation_result", p))
+                        # Feedback loop: "Continue" means a human reviewed
+                        # this script — save it to translation memory so
+                        # identical content never hits the LLM again.
+                        if tm_on:
+                            n_pairs = _tm_capture(pipeline_language, en_entries,
+                                                  punc_result, source=base)
+                            if n_pairs:
+                                self.root.after(0, lambda n=n_pairs: self.status.config(
+                                    text=f"🧠 Proofed translation saved to memory "
+                                         f"({n} pairs) — future identical content "
+                                         f"reuses it for free."))
 
                 # Stage 2: TTS
                 _chk()
@@ -7477,15 +8208,28 @@ class EndToEndApp:
                                     f"Done (SRT only) ✓ → {os.path.basename(srt_path)}")
                     continue
 
-                # Stage 1b: Gemini
-                self._batch_upd(idx+1, total, fname, "Vertex AI translation…")
-                self._batch_set_row(item, tr_status="Vertex AI running…", tag="running")
-
-                (tr_result, rev_result, punc_result,
-                 _, _, _) = _run_gemini_pipeline(formatted_srt,
-                                                  self._gemini_model_var.get(),
-                                                  language=pipeline_language,
-                                                  steps=self._translation_steps_var.get())
+                # Stage 1b: Gemini (translation memory first — an exact
+                # proofed match skips the LLM entirely)
+                tm_on = self._tm_enabled_var.get()
+                en_entries_tm = _extract_srt_entries(final_srt)
+                tm_cached = (_tm_lookup_full(pipeline_language, en_entries_tm)
+                             if tm_on else None)
+                if tm_cached:
+                    tr_result = rev_result = punc_result = tm_cached
+                    self._batch_upd(idx+1, total, fname,
+                                    "🧠 Reusing proofed translation (memory)…")
+                    self._batch_set_row(item, tr_status="✔ From memory", tag="running")
+                else:
+                    self._batch_upd(idx+1, total, fname, "Vertex AI translation…")
+                    self._batch_set_row(item, tr_status="Vertex AI running…", tag="running")
+                    tm_gloss = (_tm_glossary_block(pipeline_language, en_entries_tm)
+                                if tm_on else "")
+                    (tr_result, rev_result, punc_result,
+                     _, _, _) = _run_gemini_pipeline(formatted_srt,
+                                                      self._gemini_model_var.get(),
+                                                      language=pipeline_language,
+                                                      steps=self._translation_steps_var.get(),
+                                                      tm_glossary=tm_gloss)
 
                 # Save Step-1 Translation output (raw translation before review)
                 try:

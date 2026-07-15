@@ -7,3 +7,4 @@ google-genai
 google-cloud-texttospeech
 google-auth
 pyphen
+opencv-python
