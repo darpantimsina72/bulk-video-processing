@@ -16,6 +16,7 @@ vertex_key.json
 data/
 last_language.txt
 run_history.json
+ui_settings.json
 el_model.txt
 error_log.txt
 launch_log.txt

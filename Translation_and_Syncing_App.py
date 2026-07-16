@@ -148,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.2.0"
+APP_VERSION  = "1.3.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -474,6 +474,27 @@ def _prepare_output_dir(audio_path: str) -> str:
         pass
 
     return out_dir
+
+
+# ─── UI settings (Simple mode, auto-open result) ─────────────────────────────
+UI_SETTINGS_FILE = os.path.join(SCRIPT_DIR, "ui_settings.json")
+
+
+def _ui_settings_load() -> dict:
+    try:
+        with open(UI_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ui_settings_save(d: dict) -> None:
+    try:
+        with open(UI_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
 
 
 # ─── Run history (History tab / re-dub) ──────────────────────────────────────
@@ -3726,6 +3747,37 @@ class EndToEndApp:
         toolbar.pack_propagate(False)
         self._build_toolbar(toolbar)
 
+        # ── Simple / Advanced mode ────────────────────────────────────────────
+        _ui = _ui_settings_load()
+        self._simple_mode_var = tk.BooleanVar(
+            value=bool(_ui.get("simple_mode", True)))
+        self._auto_open_var = tk.BooleanVar(
+            value=bool(_ui.get("auto_open_result", True)))
+
+        self._mode_btn = self._btn(toolbar, "", self._toggle_ui_mode,
+                                   bg="#1e1b3a", fg="#a78bfa", abg="#312e81")
+        self._mode_btn.pack(side="right", padx=(4, 10), pady=8)
+        tk.Checkbutton(
+            toolbar, text="Auto-open result", variable=self._auto_open_var,
+            command=self._save_ui_settings,
+            bg=PANEL, fg=TEXT, selectcolor=PANEL3,
+            activebackground=PANEL, activeforeground=ACCENT,
+            font=(MONO_FONT, 9), cursor="hand2",
+        ).pack(side="right", padx=(4, 4), pady=8)
+
+        # Beginner hint bar (visible in Simple mode only)
+        self._hint_bar = tk.Frame(tab, bg="#0f1d14", bd=0,
+                                  highlightbackground="#14532d",
+                                  highlightthickness=1)
+        tk.Label(self._hint_bar,
+                 text="Quick start:   1) Paste your ElevenLabs key   →   "
+                      "2) Pick Language & Voice   →   3) Open Audio   →   "
+                      "4) ▶ Run Pipeline.    When it finishes, the result "
+                      "opens in the History tab — listen and compare there.",
+                 bg="#0f1d14", fg="#4ade80", font=(MONO_FONT, 9),
+                 anchor="w", justify="left",
+                 ).pack(side="left", padx=14, pady=6)
+
         # TTS Settings panel (before Regions)
         self._build_tts_settings_panel(tab)
 
@@ -3770,6 +3822,47 @@ class EndToEndApp:
 
         self.canvas.mpl_connect("button_press_event",  self._on_canvas_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)
+
+        # Apply the saved Simple/Advanced layout now that all panels exist.
+        self._apply_ui_mode()
+
+    # ── Simple / Advanced mode ────────────────────────────────────────────────
+
+    def _save_ui_settings(self):
+        d = _ui_settings_load()
+        d["simple_mode"]      = bool(self._simple_mode_var.get())
+        d["auto_open_result"] = bool(self._auto_open_var.get())
+        _ui_settings_save(d)
+
+    def _toggle_ui_mode(self):
+        self._simple_mode_var.set(not self._simple_mode_var.get())
+        self._apply_ui_mode()
+
+    def _apply_ui_mode(self):
+        """Simple mode hides expert-level rows (region tuning, LLM/prompt row)
+        so first-time users only see: key → voice/language → open → run."""
+        simple = self._simple_mode_var.get()
+        try:
+            self._hint_bar.pack_forget()
+            self._regions_frame_en.pack_forget()
+            self._regions_frame_bn.pack_forget()
+            self._model_row.pack_forget()
+            if simple:
+                self._hint_bar.pack(fill="x", side="top",
+                                    before=self._tts_panel_frame)
+            else:
+                # Restore original order: EN regions, BN regions, then the
+                # translation panel; LLM row back at the end of that panel.
+                self._regions_frame_en.pack(fill="x", side="top",
+                                            before=self._tp_frame)
+                self._regions_frame_bn.pack(fill="x", side="top",
+                                            before=self._tp_frame)
+                self._model_row.pack(fill="x")
+            self._mode_btn.config(
+                text="⚙ Show Advanced" if simple else "🔰 Simple Mode")
+        except Exception:
+            pass
+        self._save_ui_settings()
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.canvas.get_tk_widget().bind(seq, self._on_waveform_scroll)
 
@@ -3827,6 +3920,7 @@ class EndToEndApp:
         outer = tk.Frame(parent, bg="#1e1b3a", bd=0,
                          highlightbackground="#5b4fbf", highlightthickness=1)
         outer.pack(fill="x", side="top")
+        self._tts_panel_frame = outer   # anchor for Simple-mode hint bar
 
         # Thin header strip
         hdr = tk.Frame(outer, bg="#211e40", height=26)
@@ -4680,6 +4774,7 @@ class EndToEndApp:
                       highlightbackground=TEXT_MUTED, highlightthickness=1)
         rp.pack(fill="x", side="top")
         rp.pack_propagate(False)
+        self._regions_frame_en = rp     # hidden in Simple mode
 
         tk.Label(rp, text="ENGLISH REGIONS", bg=PANEL2, fg=REG_EDGE,
                  font=(MONO_FONT, 9, "bold")).pack(side="left", padx=(14, 10), pady=10)
@@ -4727,6 +4822,7 @@ class EndToEndApp:
                       highlightbackground="#1e3a52", highlightthickness=1)
         rp.pack(fill="x", side="top")
         rp.pack_propagate(False)
+        self._regions_frame_bn = rp     # hidden in Simple mode
 
         _bn_regions_lbl = tk.Label(rp, text="BENGALI REGIONS", bg="#0c1f2c", fg="#38bdf8",
                  font=(MONO_FONT, 9, "bold"))
@@ -4765,6 +4861,7 @@ class EndToEndApp:
         tp = tk.Frame(parent, bg=PANEL3, bd=0,
                       highlightbackground=PANEL_BORDER, highlightthickness=1)
         tp.pack(fill="x", side="top")
+        self._tp_frame = tp             # anchor for restoring hidden panels
 
         # ── Button row ────────────────────────────────────────────────────────
         row = tk.Frame(tp, bg=PANEL3, height=44)
@@ -4825,6 +4922,7 @@ class EndToEndApp:
         model_row = tk.Frame(tp, bg=PANEL3, height=34)
         model_row.pack(fill="x")
         model_row.pack_propagate(False)
+        self._model_row = model_row     # hidden in Simple mode
 
         self._llm_powered_label = tk.Label(
             model_row, text=f"Powered by {_llm_provider_label()}",
@@ -5961,6 +6059,47 @@ class EndToEndApp:
         self.hist_tree.pack(fill="both", expand=True)
         self.hist_tree.bind("<Double-1>",
                             lambda _e: self._history_redub_selected())
+        self.hist_tree.bind("<<TreeviewSelect>>",
+                            lambda _e: self._history_load_compare())
+
+        # ── Listen & Compare: English (top) vs dubbed output (bottom) ────────
+        cmp_outer = tk.Frame(tab, bg=PANEL, bd=0,
+                             highlightbackground=PANEL_BORDER,
+                             highlightthickness=1)
+        cmp_outer.pack(fill="x", padx=8, pady=(0, 4))
+
+        cmp_bar = tk.Frame(cmp_outer, bg=PANEL, height=40)
+        cmp_bar.pack(fill="x")
+        cmp_bar.pack_propagate(False)
+        tk.Label(cmp_bar, text="LISTEN & COMPARE", bg=PANEL, fg="#a78bfa",
+                 font=(MONO_FONT, 9, "bold")).pack(side="left",
+                                                   padx=(14, 12), pady=10)
+        self._btn(cmp_bar, "▶ English", lambda: self._cmp_play("en"),
+                  bg="#172554", fg=REG_LABEL, abg="#1e3a8a"
+                  ).pack(side="left", padx=(0, 6), pady=6)
+        self._btn(cmp_bar, "▶ Dubbed", lambda: self._cmp_play("out"),
+                  bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e"
+                  ).pack(side="left", padx=(0, 6), pady=6)
+        self._btn(cmp_bar, "⏹ Stop", self._cmp_stop,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414"
+                  ).pack(side="left", padx=(0, 10), pady=6)
+        self._cmp_info = tk.Label(cmp_bar, text="Select a run above to see "
+                                  "both waveforms.", bg=PANEL, fg=TEXT_FAINT,
+                                  font=(MONO_FONT, 9), anchor="w")
+        self._cmp_info.pack(side="left", fill="x", expand=True)
+
+        self._cmp_fig, (self._cmp_ax_en, self._cmp_ax_out) = plt.subplots(
+            2, 1, figsize=(12, 3.0))
+        self._cmp_fig.patch.set_facecolor(BG)
+        self._cmp_fig.subplots_adjust(left=0.055, right=0.99,
+                                      top=0.90, bottom=0.14, hspace=0.65)
+        self._cmp_canvas = FigureCanvasTkAgg(self._cmp_fig, master=cmp_outer)
+        self._cmp_canvas.get_tk_widget().configure(bg=BG)
+        self._cmp_canvas.get_tk_widget().pack(fill="x")
+        self._cmp_paths: Dict[str, str] = {}
+        self._cmp_audio_cache: Dict[Tuple[str, float], Tuple] = {}
+        self._cmp_load_token = 0
+        self._cmp_draw(None, None, "", "")
 
         self._hist_status = tk.Label(tab, text="", bg=BG, fg=TEXT_FAINT,
                                      font=(MONO_FONT, 9), anchor="w")
@@ -5969,6 +6108,185 @@ class EndToEndApp:
         self._hist_entries = []
         self._hist_redub_running = False
         self._history_refresh()
+
+    # ── History: Listen & Compare panel ──────────────────────────────────────
+
+    @staticmethod
+    def _find_latest_output(outdir: str) -> str:
+        """Newest synced/dubbed audio file in *outdir* ('' if none)."""
+        cands = []
+        try:
+            for f in os.listdir(outdir):
+                fl = f.lower()
+                if ("_synced" in fl or "_redub" in fl) \
+                        and fl.endswith((".wav", ".mp3")):
+                    p = os.path.join(outdir, f)
+                    try:
+                        cands.append((os.path.getmtime(p), p))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return max(cands)[1] if cands else ""
+
+    def _cmp_style_axis(self, ax, title, colour):
+        ax.set_facecolor("#0b1220")
+        ax.tick_params(colors=TEXT_FAINT, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_color("#1e293b")
+        ax.set_title(title, color=colour, fontsize=8,
+                     fontfamily="monospace", loc="left")
+        ax.margins(x=0)
+
+    def _cmp_draw(self, en_env, out_env, en_title, out_title,
+                  en_sr=100, out_sr=100):
+        """Draw both envelope waveforms (env arrays sampled at *sr* Hz)."""
+        for ax, env, sr, title, colour in (
+                (self._cmp_ax_en,  en_env,  en_sr,  en_title or
+                 "ENGLISH (original)", WAVEFORM),
+                (self._cmp_ax_out, out_env, out_sr, out_title or
+                 "DUBBED OUTPUT", TR_ACCENT)):
+            ax.clear()
+            self._cmp_style_axis(ax, title, colour)
+            if env is not None and len(env):
+                t = np.arange(len(env)) / float(sr)
+                ax.fill_between(t, -env, env, color=colour,
+                                linewidth=0.4, alpha=0.9)
+                ax.set_xlim(0, t[-1] if len(t) else 1)
+                ax.set_ylim(-1.05, 1.05)
+            else:
+                ax.text(0.5, 0.5, "no audio", transform=ax.transAxes,
+                        ha="center", va="center", color=TEXT_FAINT,
+                        fontsize=8, fontfamily="monospace")
+                ax.set_xticks([]); ax.set_yticks([])
+        try:
+            self._cmp_canvas.draw_idle()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cmp_envelope(path: str, points_per_sec: int = 100):
+        """Load *path* and return (envelope, points_per_sec, duration_s)."""
+        y, sr = librosa.load(path, sr=None, mono=True)
+        if not len(y):
+            return np.zeros(1), points_per_sec, 0.0
+        hop = max(1, int(sr / points_per_sec))
+        n   = len(y) // hop
+        env = np.abs(y[:n * hop]).reshape(n, hop).max(axis=1)
+        peak = float(env.max()) or 1.0
+        return (env / peak).astype(np.float32), points_per_sec, len(y) / sr
+
+    def _history_load_compare(self):
+        """Load the selected run's English + dubbed waveforms (async)."""
+        sel = self.hist_tree.selection()
+        if not sel:
+            return
+        try:
+            e = self._hist_entries[int(sel[0])]
+        except Exception:
+            return
+        en_path  = e.get("audio_path", "")
+        out_path = self._find_latest_output(e.get("outdir", ""))
+        language = e.get("language", "") or "DUBBED"
+        self._cmp_paths = {"en": en_path, "out": out_path}
+        self._cmp_info.config(text="Loading waveforms…", fg=TEXT_FAINT)
+        self._cmp_load_token += 1
+        token = self._cmp_load_token
+
+        def worker():
+            def env_for(path):
+                if not path or not os.path.exists(path):
+                    return None, 100, 0.0
+                key = (path, os.path.getmtime(path))
+                if key not in self._cmp_audio_cache:
+                    try:
+                        self._cmp_audio_cache[key] = self._cmp_envelope(path)
+                    except Exception:
+                        return None, 100, 0.0
+                return self._cmp_audio_cache[key]
+
+            en_env,  en_sr,  en_dur  = env_for(en_path)
+            out_env, out_sr, out_dur = env_for(out_path)
+
+            def done():
+                if token != self._cmp_load_token or getattr(self, "_closing", False):
+                    return              # superseded selection or app closing
+                self._cmp_draw(
+                    en_env, out_env,
+                    f"ENGLISH (original) — {os.path.basename(en_path) or '?'} "
+                    f"· {en_dur:.1f}s",
+                    f"{language.upper()} (dubbed output) — "
+                    f"{os.path.basename(out_path) or 'not found'} "
+                    f"· {out_dur:.1f}s",
+                    en_sr, out_sr)
+                if out_path:
+                    self._cmp_info.config(
+                        text="Ready — use ▶ English / ▶ Dubbed to listen.",
+                        fg=TEXT_FAINT)
+                else:
+                    self._cmp_info.config(
+                        text="No dubbed output file in this run's folder yet "
+                             "(run the Full Pipeline or Re-Dub).",
+                        fg="#fbbf24")
+            try:
+                self.root.after(0, done)
+            except Exception:
+                pass    # window closed while loading
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cmp_play(self, which: str):
+        path = self._cmp_paths.get(which, "")
+        if not path or not os.path.exists(path):
+            self._cmp_info.config(text="No audio file for that button — "
+                                  "select a run first.", fg="#fbbf24")
+            return
+        self._cmp_info.config(text=f"Playing {os.path.basename(path)}…",
+                              fg=TR_ACCENT)
+
+        def worker():
+            try:
+                y, sr = librosa.load(path, sr=None, mono=True)
+                sd.stop()
+                sd.play(y.astype(np.float32), samplerate=sr)
+            except Exception as ex:
+                self.root.after(0, lambda: self._cmp_info.config(
+                    text=f"Playback failed: {ex}", fg="#f87171"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cmp_stop(self):
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self._cmp_info.config(text="Stopped.", fg=TEXT_FAINT)
+
+    def _show_run_result(self, base: str = None, language: str = None):
+        """Jump to the History tab and load the run's waveforms. Called on
+        pipeline / batch / re-dub completion when Auto-open result is on."""
+        if not getattr(self, "_auto_open_var", None) \
+                or not self._auto_open_var.get():
+            return
+        try:
+            self._history_refresh()
+            target_iid = None
+            if base:
+                key = (os.path.abspath(base), language)
+                for idx, e in enumerate(self._hist_entries):
+                    if (os.path.abspath(e.get("base", "")),
+                            e.get("language")) == key:
+                        target_iid = str(idx)
+                        break
+            if target_iid is None and self.hist_tree.get_children():
+                target_iid = self.hist_tree.get_children()[0]
+            if target_iid is not None:
+                self.hist_tree.selection_set(target_iid)
+                self.hist_tree.see(target_iid)
+            self.notebook.select(self.hist_tab)
+            self._history_load_compare()
+        except Exception:
+            pass
 
     def _history_refresh(self):
         self._hist_entries = _history_load()
@@ -6298,6 +6616,8 @@ class EndToEndApp:
                 _st(f"✔ Re-dub {rev:02d} complete → "
                     f"{os.path.basename(synced_path)}", TR_ACCENT)
                 self.root.after(0, self._history_refresh)
+                self.root.after(0, lambda b=base, l=language:
+                    self._show_run_result(b, l))
 
             except Exception as exc:
                 import traceback
@@ -7055,6 +7375,8 @@ class EndToEndApp:
                     self._as_status.config(
                         text=f"All stages complete ✓ Synced audio → {p}",
                         fg=TR_ACCENT))
+                self.root.after(0, lambda b=base, l=pipeline_language:
+                    self._show_run_result(b, l))
 
             except Exception as exc:
                 import traceback
@@ -8047,6 +8369,7 @@ class EndToEndApp:
                     self.btn_cancel_pipeline.config(state="disabled")
                     self.tr_status.config(text="All stages complete ✓", fg=TR_ACCENT)
                     self.status.config(text=f"Done! Synced audio → {synced_path}")
+                    self._show_run_result(base, pipeline_language)
 
                 self.root.after(0, _on_complete)
 
@@ -8394,6 +8717,8 @@ class EndToEndApp:
         self.root.after(0, lambda: self.batch_progress_label.config(
             text=f"Batch complete — {done_count}/{total} files fully processed.",
             fg=TR_ACCENT))
+        if done_count:
+            self.root.after(0, self._show_run_result)
 
     def _batch_set_row(self, item, tr_status=None, tts_status=None, sync_status=None,
                        output=None, tag=None):

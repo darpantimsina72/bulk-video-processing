@@ -55,6 +55,25 @@ Keys and settings are stored **only on your computer**
 (`api.txt`, `llm_settings.json`, `TTS_Key.json`, `vertex_key.json`) —
 they are never uploaded to GitHub.
 
+## Using the app (Simple mode)
+
+The app starts in **Simple mode** — only the essentials are visible:
+
+1. Paste your ElevenLabs key (once).
+2. Pick **Language** and voice.
+3. **Open Audio** and press **▶ Run Pipeline**.
+4. When it finishes, the app **jumps to the History tab automatically**:
+   the English waveform is shown on top, the dubbed output below —
+   press **▶ English** / **▶ Dubbed** to listen and compare.
+
+Every run stays in the **History** tab, so you can always come back later,
+listen again, open the output folder, or **Edit Text & Re-Dub** without
+paying for re-translation.
+
+Power users: click **⚙ Show Advanced** (top-right) to reveal region tuning,
+the LLM provider row, and prompt-chain options. The choice is remembered.
+Untick **Auto-open result** if you don't want the automatic jump.
+
 ## Updating the app
 
 Click **⟳ Check for Updates** (top row in the Translation tab).
