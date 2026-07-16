@@ -55,24 +55,34 @@ Keys and settings are stored **only on your computer**
 (`api.txt`, `llm_settings.json`, `TTS_Key.json`, `vertex_key.json`) —
 they are never uploaded to GitHub.
 
-## Using the app (Simple mode)
+## Using the app — project workflow
 
-The app starts in **Simple mode** — only the essentials are visible:
+The app opens to the **Projects screen** (like DaVinci Resolve):
 
-1. Paste your ElevenLabs key (once).
-2. Pick **Language** and voice.
-3. **Open Audio** and press **▶ Run Pipeline**.
-4. When it finishes, the app **jumps to the History tab automatically**:
-   the English waveform is shown on top, the dubbed output below —
-   press **▶ English** / **▶ Dubbed** to listen and compare.
+- **➕ New Project** → name it, pick the English audio + target language →
+  the workspace opens with everything pre-loaded.
+- **Double-click an old project** → continue exactly where you left off.
+  All old runs appear here automatically.
 
-Every run stays in the **History** tab, so you can always come back later,
-listen again, open the output folder, or **Edit Text & Re-Dub** without
-paying for re-translation.
+Inside the workspace, the **stage bar at the bottom** tracks the process:
 
-Power users: click **⚙ Show Advanced** (top-right) to reveal region tuning,
-the LLM provider row, and prompt-chain options. The choice is remembered.
-Untick **Auto-open result** if you don't want the automatic jump.
+```
+①  Setup & Run   →   ②  Transcript   →   ③  Translation   →   ④  Result
+```
+
+- Press **▶ Run Pipeline** once (stage ①) — stages turn ✓ as they finish.
+- **② Transcript** — the English SRT, side by side with
+  **③ Translation** — editable; *💾 Save Translation* keeps versions,
+  *🔁 Re-Dub with this text* re-voices without paying for re-translation.
+- **④ Result** — English waveform on top, dubbed output below;
+  **▶ English / ▶ Dubbed** to listen and compare.
+- **⌂ Projects** (bottom-right) returns to the project screen.
+  Everything is saved automatically — close the app any time.
+
+The workspace starts in **Simple mode** (essentials only). Click
+**⚙ Show Advanced** (top-right) for region tuning, the LLM provider row and
+prompt-chain options. Untick **Auto-open result** to disable the automatic
+jump to ④ Result when a run finishes.
 
 ## Updating the app
 

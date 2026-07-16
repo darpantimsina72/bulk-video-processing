@@ -148,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.3.0"
+APP_VERSION  = "1.4.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -493,6 +493,125 @@ def _ui_settings_save(d: dict) -> None:
     try:
         with open(UI_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
+    except Exception:
+        pass
+
+
+# ─── Projects (launch-screen project manager) ─────────────────────────────────
+PROJECTS_FILE  = os.path.join(SCRIPT_DIR, "projects.json")
+_PROJECTS_LOCK = threading.Lock()
+
+
+def _find_latest_output_file(outdir: str) -> str:
+    """Newest synced/dubbed audio file in *outdir* ('' if none)."""
+    cands = []
+    try:
+        for f in os.listdir(outdir):
+            fl = f.lower()
+            if ("_synced" in fl or "_redub" in fl) \
+                    and fl.endswith((".wav", ".mp3")):
+                p = os.path.join(outdir, f)
+                try:
+                    cands.append((os.path.getmtime(p), p))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return max(cands)[1] if cands else ""
+
+
+def _projects_load() -> List[dict]:
+    """Project registry entries, most recently updated first. Never raises."""
+    try:
+        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("projects", []) if isinstance(data, dict) else []
+        entries = [e for e in entries if isinstance(e, dict) and e.get("base")]
+        entries.sort(key=lambda e: e.get("updated", e.get("created", "")),
+                     reverse=True)
+        return entries
+    except Exception:
+        return []
+
+
+def _projects_save(entries: List[dict]) -> None:
+    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"projects": entries}, f, ensure_ascii=False, indent=2)
+
+
+def _project_key(e: dict):
+    return (os.path.abspath(e.get("base", "")), e.get("language", ""))
+
+
+def _project_upsert(entry: dict) -> None:
+    """Insert/refresh a project (keyed by base+language). Never raises."""
+    try:
+        with _PROJECTS_LOCK:
+            entries = _projects_load()
+            key = _project_key(entry)
+            old = next((e for e in entries if _project_key(e) == key), None)
+            if old:
+                old.update({k: v for k, v in entry.items() if v})
+                old["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                merged = old
+            else:
+                entry.setdefault("created",
+                                 time.strftime("%Y-%m-%d %H:%M:%S"))
+                entry["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                entries.insert(0, entry)
+                merged = entry
+            _projects_save(entries)
+            # Portable copy inside the project folder
+            try:
+                with open(os.path.join(merged.get("outdir", ""),
+                                       "project.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(merged, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _project_remove(base: str, language: str) -> None:
+    try:
+        with _PROJECTS_LOCK:
+            key = (os.path.abspath(base), language)
+            entries = [e for e in _projects_load()
+                       if _project_key(e) != key]
+            _projects_save(entries)
+    except Exception:
+        pass
+
+
+def _project_stage_status(e: dict) -> Dict[str, bool]:
+    """Which stages have outputs on disk (stateless — survives crashes)."""
+    base   = e.get("base", "")
+    outdir = e.get("outdir", "")
+    return {
+        "transcript":  os.path.exists(base + "_sync_en.srt")
+                       or os.path.exists(base + ".srt"),
+        "translation": os.path.exists(base + "_FinalScript.txt"),
+        "result":      bool(_find_latest_output_file(outdir)),
+    }
+
+
+def _projects_sync_from_history() -> None:
+    """Every run-history entry becomes a project card (old runs included)."""
+    try:
+        known = {_project_key(e) for e in _projects_load()}
+        for h in _history_load():
+            key = (os.path.abspath(h.get("base", "")), h.get("language", ""))
+            if key in known:
+                continue
+            _project_upsert({
+                "name":       os.path.basename(h.get("base", "")) or "run",
+                "language":   h.get("language", ""),
+                "audio_path": h.get("audio_path", ""),
+                "outdir":     h.get("outdir", ""),
+                "base":       h.get("base", ""),
+                "created":    h.get("ts", ""),
+            })
     except Exception:
         pass
 
@@ -3715,25 +3834,40 @@ class EndToEndApp:
         style.map("Horizontal.TScrollbar",
                   background=[("active", PANEL3), ("pressed", PANEL_BORDER)])
 
-        self.notebook = ttk.Notebook(self.root, style="Dark.TNotebook")
+        # ── Workspace: notebook + bottom stage bar (shown once a project is
+        #    open); the Project Manager screen is shown first instead.
+        self._workspace = tk.Frame(self.root, bg=BG)
+        self._current_project: Optional[dict] = None
+
+        self._build_stage_bar(self._workspace)       # packs side="bottom"
+
+        self.notebook = ttk.Notebook(self._workspace, style="Dark.TNotebook")
         self.notebook.pack(fill="both", expand=True)
 
-        self.main_tab  = tk.Frame(self.notebook, bg=BG)
-        self.batch_tab = tk.Frame(self.notebook, bg=BG)
-        self.tts_tab   = tk.Frame(self.notebook, bg=BG)
-        self.sync_tab  = tk.Frame(self.notebook, bg=BG)
-        self.hist_tab  = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.main_tab,  text="  Single File  ")
-        self.notebook.add(self.batch_tab, text="  Batch Process  ")
-        self.notebook.add(self.tts_tab,   text="  TTS  ")
-        self.notebook.add(self.sync_tab,  text="  Audio Syncing  ")
-        self.notebook.add(self.hist_tab,  text="  History  ")
+        self.main_tab    = tk.Frame(self.notebook, bg=BG)
+        self.batch_tab   = tk.Frame(self.notebook, bg=BG)
+        self.tts_tab     = tk.Frame(self.notebook, bg=BG)
+        self.sync_tab    = tk.Frame(self.notebook, bg=BG)
+        self.scripts_tab = tk.Frame(self.notebook, bg=BG)
+        self.hist_tab    = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.main_tab,    text="  Single File  ")
+        self.notebook.add(self.batch_tab,   text="  Batch Process  ")
+        self.notebook.add(self.tts_tab,     text="  TTS  ")
+        self.notebook.add(self.sync_tab,    text="  Audio Syncing  ")
+        self.notebook.add(self.scripts_tab, text="  Scripts  ")
+        self.notebook.add(self.hist_tab,    text="  History  ")
 
         self._build_main_tab()
         self._build_batch_tab()
         self._build_tts_tab()
         self._build_audio_sync_tab()
+        self._build_scripts_tab()
         self._build_history_tab()
+
+        # ── Project Manager (launch screen) ──────────────────────────────────
+        self._pm_frame = tk.Frame(self.root, bg=BG)
+        self._build_project_manager()
+        self._show_project_manager()
 
     # ── Single File Tab ───────────────────────────────────────────────────────
     def _build_main_tab(self):
@@ -6114,20 +6248,7 @@ class EndToEndApp:
     @staticmethod
     def _find_latest_output(outdir: str) -> str:
         """Newest synced/dubbed audio file in *outdir* ('' if none)."""
-        cands = []
-        try:
-            for f in os.listdir(outdir):
-                fl = f.lower()
-                if ("_synced" in fl or "_redub" in fl) \
-                        and fl.endswith((".wav", ".mp3")):
-                    p = os.path.join(outdir, f)
-                    try:
-                        cands.append((os.path.getmtime(p), p))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return max(cands)[1] if cands else ""
+        return _find_latest_output_file(outdir)
 
     def _cmp_style_axis(self, ax, title, colour):
         ax.set_facecolor("#0b1220")
@@ -6265,6 +6386,16 @@ class EndToEndApp:
     def _show_run_result(self, base: str = None, language: str = None):
         """Jump to the History tab and load the run's waveforms. Called on
         pipeline / batch / re-dub completion when Auto-open result is on."""
+        # Keep project state fresh regardless of the auto-open preference.
+        try:
+            e = self._current_project
+            if e and base and os.path.abspath(base) == \
+                    os.path.abspath(e.get("base", "")):
+                _project_upsert(e)          # bumps 'updated'
+            self._refresh_stage_bar()
+            self._scripts_load_project()
+        except Exception:
+            pass
         if not getattr(self, "_auto_open_var", None) \
                 or not self._auto_open_var.get():
             return
@@ -7407,6 +7538,11 @@ class EndToEndApp:
             self.root.after(0, lambda: var.set(msg))
             if colour:
                 self.root.after(0, lambda: lbl.config(fg=colour))
+        # Mirror progress onto the bottom stage bar
+        try:
+            self.root.after(0, lambda: self._stage_bar_pulse(tag, msg))
+        except Exception:
+            pass
 
     def _cancel_pipeline(self):
         self._pipeline_cancel.set()
@@ -8742,6 +8878,550 @@ class EndToEndApp:
         self.root.after(0, lambda m=msg: self.batch_progress_label.config(text=m, fg=ACCENT))
 
     # ─────────────────────────────────────────────────────────────────────────
+    #  Project Manager (launch screen), stage bar & Scripts tab
+    # ─────────────────────────────────────────────────────────────────────────
+
+    _STAGES = [
+        ("①  Setup & Run",  "setup"),
+        ("②  Transcript",   "transcript"),
+        ("③  Translation",  "translation"),
+        ("④  Result",       "result"),
+    ]
+
+    def _build_stage_bar(self, parent):
+        bar = tk.Frame(parent, bg="#0b1220", height=48, bd=0,
+                       highlightbackground=PANEL_BORDER, highlightthickness=1)
+        bar.pack(side="bottom", fill="x")
+        bar.pack_propagate(False)
+
+        self._proj_label = tk.Label(bar, text="", bg="#0b1220", fg="#a78bfa",
+                                    font=(MONO_FONT, 9, "bold"))
+        self._proj_label.pack(side="left", padx=(14, 18), pady=12)
+
+        self._stage_btns: Dict[str, tk.Button] = {}
+        for label, key in self._STAGES:
+            b = tk.Button(bar, text=label,
+                          command=lambda k=key: self._goto_stage(k),
+                          bg="#0b1220", fg=_btn_fg(TEXT_MUTED),
+                          activebackground="#1e293b",
+                          activeforeground=_btn_fg(ACCENT),
+                          relief="flat", bd=0, cursor="hand2",
+                          font=(MONO_FONT, 10, "bold"), padx=14, pady=6)
+            b.pack(side="left", padx=2, pady=6)
+            self._stage_btns[key] = b
+
+        self._btn(bar, "⌂ Projects", self._show_project_manager,
+                  bg="#1e1b3a", fg="#a78bfa", abg="#312e81"
+                  ).pack(side="right", padx=(4, 12), pady=8)
+
+    def _refresh_stage_bar(self):
+        e = self._current_project
+        status = _project_stage_status(e) if e else {}
+        for label, key in self._STAGES:
+            btn = self._stage_btns.get(key)
+            if not btn:
+                continue
+            done = status.get(key, key == "setup" and bool(e))
+            btn.config(text=label + ("  ✓" if done and key != "setup" else ""),
+                       fg=_btn_fg(TR_ACCENT if done else TEXT_MUTED))
+        if e:
+            self._proj_label.config(
+                text=f"🎬 {e.get('name', '?')}  ·  {e.get('language', '')}")
+        else:
+            self._proj_label.config(text="")
+
+    def _goto_stage(self, key: str):
+        if key == "setup":
+            self.notebook.select(self.main_tab)
+        elif key in ("transcript", "translation"):
+            self._scripts_load_project()
+            self.notebook.select(self.scripts_tab)
+            try:
+                (self._scr_en_text if key == "transcript"
+                 else self._scr_tr_text).focus_set()
+            except Exception:
+                pass
+        elif key == "result":
+            e = self._current_project
+            if e:
+                # reuse the auto-open path: select run + load compare
+                auto = self._auto_open_var.get()
+                self._auto_open_var.set(True)
+                self._show_run_result(e.get("base"), e.get("language"))
+                self._auto_open_var.set(auto)
+            else:
+                self.notebook.select(self.hist_tab)
+
+    # ── Stage-bar live tint while the pipeline runs ───────────────────────────
+
+    _PIPE_TO_STAGE = {"S1a": "transcript", "S1b": "translation",
+                      "S2": "result", "S3a": "result", "S3b": "result",
+                      "S3c": "result", "S3d": "result", "S3e": "result"}
+
+    def _stage_bar_pulse(self, tag: str, msg: str):
+        key = self._PIPE_TO_STAGE.get(tag.strip())
+        btn = getattr(self, "_stage_btns", {}).get(key)
+        if not btn:
+            return
+        try:
+            if msg.startswith("✔"):
+                self._refresh_stage_bar()
+            elif msg not in ("—", ""):
+                btn.config(fg=_btn_fg("#d97706"))   # running — amber
+        except Exception:
+            pass
+
+    # ── Project Manager screen ────────────────────────────────────────────────
+
+    def _build_project_manager(self):
+        pm = self._pm_frame
+
+        hdr = tk.Frame(pm, bg=PANEL, height=64, bd=0,
+                       highlightbackground=PANEL_BORDER, highlightthickness=1)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="🎬 PROJECTS", bg=PANEL, fg="#a78bfa",
+                 font=(MONO_FONT, 14, "bold")).pack(side="left",
+                                                    padx=18, pady=16)
+        self._btn(hdr, "➕ New Project", self._pm_new_project,
+                  bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e"
+                  ).pack(side="left", padx=(8, 4), pady=14)
+        self._btn(hdr, "↻ Refresh", self._pm_refresh,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT
+                  ).pack(side="left", padx=4, pady=14)
+        self._btn(hdr, "🗑 Remove", self._pm_delete_selected,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414"
+                  ).pack(side="right", padx=(4, 14), pady=14)
+        self._btn(hdr, "📂 Open Folder", self._pm_open_folder,
+                  bg="#172554", fg=REG_LABEL, abg="#1e3a8a"
+                  ).pack(side="right", padx=4, pady=14)
+        self._btn(hdr, "▶ Open Project", self._pm_open_selected,
+                  bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e"
+                  ).pack(side="right", padx=4, pady=14)
+
+        tk.Label(pm, text="Double-click a project to continue where you left "
+                          "off — every stage output is saved automatically.",
+                 bg=BG, fg=TEXT_FAINT, font=(MONO_FONT, 9),
+                 anchor="w").pack(fill="x", padx=18, pady=(8, 4))
+
+        wrap = tk.Frame(pm, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        self._pm_canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(wrap, orient="vertical",
+                            command=self._pm_canvas.yview)
+        self._pm_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._pm_canvas.pack(side="left", fill="both", expand=True)
+        self._pm_inner = tk.Frame(self._pm_canvas, bg=BG)
+        self._pm_win = self._pm_canvas.create_window(
+            (0, 0), window=self._pm_inner, anchor="nw")
+        self._pm_inner.bind("<Configure>", lambda _e: self._pm_canvas.configure(
+            scrollregion=self._pm_canvas.bbox("all")))
+        self._pm_canvas.bind("<Configure>", lambda ev: self._pm_canvas.itemconfigure(
+            self._pm_win, width=ev.width))
+
+        self._pm_status = tk.Label(pm, text="", bg=BG, fg=TEXT_FAINT,
+                                   font=(MONO_FONT, 9), anchor="w")
+        self._pm_status.pack(fill="x", padx=18, pady=(0, 10))
+
+        self._pm_entries: List[dict] = []
+        self._pm_selected: Optional[int] = None
+        self._pm_cards: List[tk.Frame] = []
+
+    def _pm_refresh(self):
+        _projects_sync_from_history()
+        self._pm_entries = _projects_load()
+        self._pm_selected = None
+        for w in self._pm_inner.winfo_children():
+            w.destroy()
+        self._pm_cards = []
+
+        if not self._pm_entries:
+            tk.Label(self._pm_inner,
+                     text="\n\nNo projects yet.\n\nClick  ➕ New Project  to "
+                          "start:  pick an English audio file and a language "
+                          "— everything else is automatic.",
+                     bg=BG, fg=TEXT_FAINT, font=(MONO_FONT, 11),
+                     justify="center").pack(pady=60, fill="x")
+            self._pm_status.config(text="0 projects.")
+            return
+
+        for idx, e in enumerate(self._pm_entries):
+            st = _project_stage_status(e)
+            card = tk.Frame(self._pm_inner, bg=PANEL, bd=0,
+                            highlightbackground=PANEL_BORDER,
+                            highlightthickness=1)
+            card.pack(fill="x", pady=3)
+            top = tk.Frame(card, bg=PANEL)
+            top.pack(fill="x", padx=12, pady=(8, 0))
+            tk.Label(top, text=e.get("name", "?"), bg=PANEL, fg=TEXT,
+                     font=(MONO_FONT, 11, "bold")).pack(side="left")
+            tk.Label(top, text=f"  ·  {e.get('language', '?')}",
+                     bg=PANEL, fg="#a78bfa",
+                     font=(MONO_FONT, 10)).pack(side="left")
+            tk.Label(top, text=e.get("updated", e.get("created", "")),
+                     bg=PANEL, fg=TEXT_FAINT,
+                     font=(MONO_FONT, 9)).pack(side="right")
+            prog = "   ".join(
+                f"{lbl.split()[0]} {'✓' if st.get(key) else '·'}"
+                for lbl, key in self._STAGES[1:])
+            bot = tk.Frame(card, bg=PANEL)
+            bot.pack(fill="x", padx=12, pady=(2, 8))
+            tk.Label(bot, text=prog, bg=PANEL, fg=TR_ACCENT,
+                     font=(MONO_FONT, 9)).pack(side="left")
+            tk.Label(bot, text=e.get("outdir", ""), bg=PANEL, fg=TEXT_FAINT,
+                     font=(MONO_FONT, 8)).pack(side="right")
+
+            def _bind_all(w, i=idx):
+                w.bind("<Button-1>",  lambda _e2, j=i: self._pm_select(j))
+                w.bind("<Double-1>",  lambda _e2, j=i: self._pm_open(j))
+                for c in w.winfo_children():
+                    _bind_all(c, i)
+            _bind_all(card)
+            self._pm_cards.append(card)
+
+        self._pm_status.config(text=f"{len(self._pm_entries)} project(s).")
+
+    def _pm_select(self, idx: int):
+        self._pm_selected = idx
+        for i, card in enumerate(self._pm_cards):
+            card.config(highlightbackground=(
+                "#3b82f6" if i == idx else PANEL_BORDER),
+                highlightthickness=(2 if i == idx else 1))
+
+    def _pm_open(self, idx: int):
+        try:
+            self._open_project(self._pm_entries[idx])
+        except Exception as ex:
+            self._pm_status.config(text=f"Could not open project: {ex}",
+                                   fg="#f87171")
+
+    def _pm_open_selected(self):
+        if self._pm_selected is None:
+            self._pm_status.config(text="Select a project first "
+                                   "(click a card).", fg="#fbbf24")
+            return
+        self._pm_open(self._pm_selected)
+
+    def _pm_open_folder(self):
+        if self._pm_selected is None:
+            self._pm_status.config(text="Select a project first.",
+                                   fg="#fbbf24")
+            return
+        path = self._pm_entries[self._pm_selected].get("outdir", "")
+        if not os.path.isdir(path):
+            self._pm_status.config(text=f"Folder missing: {path}",
+                                   fg="#f87171")
+            return
+        import subprocess
+        try:
+            if IS_WINDOWS:
+                os.startfile(path)          # noqa — Windows only
+            elif IS_MAC:
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as ex:
+            self._pm_status.config(text=f"Could not open folder: {ex}",
+                                   fg="#f87171")
+
+    def _pm_delete_selected(self):
+        if self._pm_selected is None:
+            self._pm_status.config(text="Select a project first.",
+                                   fg="#fbbf24")
+            return
+        e = self._pm_entries[self._pm_selected]
+        if not messagebox.askyesno(
+                "Remove project",
+                f"Remove “{e.get('name')}” from the project list?\n\n"
+                "Files on disk are NOT deleted."):
+            return
+        _project_remove(e.get("base", ""), e.get("language", ""))
+        self._pm_refresh()
+
+    def _pm_new_project(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New Project")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        body = tk.Frame(dlg, bg=PANEL, padx=16, pady=14)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="NEW PROJECT", bg=PANEL, fg="#a78bfa",
+                 font=(MONO_FONT, 11, "bold")).pack(anchor="w", pady=(0, 10))
+
+        name_var  = tk.StringVar()
+        audio_var = tk.StringVar()
+        lang_var  = tk.StringVar(value=self._current_language())
+
+        def _row(label):
+            r = tk.Frame(body, bg=PANEL)
+            r.pack(fill="x", pady=4)
+            tk.Label(r, text=label, bg=PANEL, fg=TEXT_FAINT, width=14,
+                     anchor="w", font=(MONO_FONT, 9)).pack(side="left")
+            return r
+
+        r = _row("Project name:")
+        tk.Entry(r, textvariable=name_var, width=38, bg=INPUT_BG,
+                 fg=INPUT_FG, insertbackground=INPUT_FG, relief="flat",
+                 font=(MONO_FONT, 9)).pack(side="left", ipady=3)
+
+        r = _row("English audio:")
+        tk.Entry(r, textvariable=audio_var, width=30, bg=INPUT_BG,
+                 fg=INPUT_FG, insertbackground=INPUT_FG, relief="flat",
+                 font=(MONO_FONT, 9)).pack(side="left", ipady=3)
+
+        def _browse():
+            p = filedialog.askopenfilename(
+                parent=dlg, title="Choose English audio",
+                filetypes=[("Audio Files",
+                            "*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a"),
+                           ("All Files", "*.*")])
+            if p:
+                audio_var.set(p)
+                if not name_var.get().strip():
+                    name_var.set(os.path.splitext(os.path.basename(p))[0])
+        tk.Button(r, text="Browse…", command=_browse, bg=PANEL3,
+                  fg=_btn_fg(TEXT), relief="flat", cursor="hand2",
+                  font=(MONO_FONT, 8)).pack(side="left", padx=(6, 0))
+
+        r = _row("Language:")
+        ttk.Combobox(r, textvariable=lang_var,
+                     values=list(TTS_LANGUAGES.keys()), state="readonly",
+                     width=16).pack(side="left")
+
+        status = tk.Label(body, text="", bg=PANEL, fg="#f87171",
+                          font=(MONO_FONT, 9), anchor="w")
+        status.pack(fill="x", pady=(6, 4))
+
+        def _create():
+            audio = audio_var.get().strip()
+            name  = name_var.get().strip() \
+                or os.path.splitext(os.path.basename(audio))[0]
+            lang  = lang_var.get()
+            if not audio or not os.path.exists(audio):
+                status.config(text="Pick a valid audio file first.")
+                return
+            outdir = _prepare_output_dir(audio)
+            base   = os.path.join(
+                outdir, os.path.splitext(os.path.basename(audio))[0])
+            entry = {"name": name, "language": lang,
+                     "audio_path": os.path.abspath(audio),
+                     "outdir": os.path.abspath(outdir),
+                     "base": os.path.abspath(base)}
+            _project_upsert(entry)
+            dlg.destroy()
+            self._open_project(entry)
+
+        btns = tk.Frame(body, bg=PANEL)
+        btns.pack(fill="x", pady=(4, 0))
+        tk.Button(btns, text="Create & Open", command=_create,
+                  bg="#2563eb", fg=_btn_fg("white"),
+                  font=(MONO_FONT, 9, "bold"), relief="flat",
+                  cursor="hand2", padx=16).pack(side="right")
+        tk.Button(btns, text="Cancel", command=dlg.destroy, bg=PANEL3,
+                  fg=_btn_fg(TEXT), font=(MONO_FONT, 9), relief="flat",
+                  cursor="hand2", padx=10).pack(side="right", padx=(0, 8))
+
+    def _show_project_manager(self):
+        try:
+            self._workspace.pack_forget()
+        except Exception:
+            pass
+        self._pm_refresh()
+        self._pm_frame.pack(fill="both", expand=True)
+
+    def _open_project(self, e: dict):
+        """Open a project: restore language + audio + stage state."""
+        self._pm_frame.pack_forget()
+        self._workspace.pack(fill="both", expand=True)
+        self._current_project = e
+
+        # Language first (drives voice list + prompts + labels)
+        lang = e.get("language", "")
+        if lang in TTS_LANGUAGES and self._tts_language_var \
+                and self._tts_language_var.get() != lang:
+            self._tts_language_var.set(lang)
+            self._on_tts_language_change()
+
+        # Load the project's audio into the Single File tab (prefer the copy
+        # inside the project folder — it always travels with the project).
+        audio = ""
+        for cand in (e.get("base", "") + os.path.splitext(
+                         e.get("audio_path", ""))[1] or "",
+                     e.get("audio_path", "")):
+            if cand and os.path.exists(cand):
+                audio = cand
+                break
+        if audio and audio != (self.filepath or ""):
+            self._load_audio_from_path(audio)
+
+        _project_upsert({k: e.get(k, "") for k in
+                         ("name", "language", "audio_path", "outdir", "base")})
+        self._scripts_load_project()
+        self._refresh_stage_bar()
+        self.notebook.select(self.main_tab)
+
+    # ── Scripts tab (② Transcript / ③ Translation) ───────────────────────────
+
+    def _build_scripts_tab(self):
+        tab = self.scripts_tab
+
+        bar = tk.Frame(tab, bg=PANEL, height=48, bd=0,
+                       highlightbackground=PANEL_BORDER, highlightthickness=1)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="SCRIPTS", bg=PANEL, fg="#a78bfa",
+                 font=(MONO_FONT, 10, "bold")).pack(side="left",
+                                                    padx=(14, 12), pady=12)
+        self._btn(bar, "💾 Save Translation", self._scripts_save_translation,
+                  bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e"
+                  ).pack(side="left", padx=(0, 6), pady=8)
+        self._btn(bar, "🔁 Re-Dub with this text…", self._scripts_redub,
+                  bg="#172554", fg=REG_LABEL, abg="#1e3a8a"
+                  ).pack(side="left", padx=(0, 6), pady=8)
+        self._btn(bar, "↻ Reload", self._scripts_load_project,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT
+                  ).pack(side="left", padx=(0, 6), pady=8)
+        self._scr_status = tk.Label(bar, text="", bg=PANEL, fg=TEXT_FAINT,
+                                    font=(MONO_FONT, 9), anchor="w")
+        self._scr_status.pack(side="left", fill="x", expand=True, padx=8)
+
+        panes = tk.Frame(tab, bg=BG)
+        panes.pack(fill="both", expand=True, padx=8, pady=8)
+        panes.columnconfigure(0, weight=1, uniform="scr")
+        panes.columnconfigure(1, weight=1, uniform="scr")
+        panes.rowconfigure(1, weight=1)
+
+        tk.Label(panes, text="② ENGLISH TRANSCRIPT (read-only)",
+                 bg=BG, fg=REG_EDGE, font=(MONO_FONT, 9, "bold"),
+                 anchor="w").grid(row=0, column=0, sticky="ew",
+                                  padx=(0, 4), pady=(0, 2))
+        self._scr_tr_label = tk.Label(
+            panes, text="③ TRANSLATION (editable)",
+            bg=BG, fg=TR_ACCENT, font=(MONO_FONT, 9, "bold"), anchor="w")
+        self._scr_tr_label.grid(row=0, column=1, sticky="ew",
+                                padx=(4, 0), pady=(0, 2))
+
+        self._scr_en_text = scrolledtext.ScrolledText(
+            panes, wrap="word", bg=PANEL, fg=TEXT, insertbackground=TEXT,
+            font=(MONO_FONT, 10), relief="flat")
+        self._scr_en_text.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        self._scr_tr_text = scrolledtext.ScrolledText(
+            panes, wrap="word", bg=PANEL, fg=TEXT, insertbackground=TEXT,
+            font=(MONO_FONT, 11), relief="flat")
+        self._scr_tr_text.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
+
+    def _scripts_paths(self):
+        e = self._current_project or {}
+        base = e.get("base", "")
+        if not base:
+            return "", ""
+        srt = base + ".srt"
+        if not os.path.exists(srt):
+            srt = base + "_sync_en.srt"
+        return srt, base + "_FinalScript.txt"
+
+    def _scripts_load_project(self):
+        srt_path, fs_path = self._scripts_paths()
+        lang = (self._current_project or {}).get("language", "")
+        self._scr_tr_label.config(
+            text=f"③ {lang.upper() or 'TRANSLATION'} (editable)")
+
+        self._scr_en_text.config(state="normal")
+        self._scr_en_text.delete("1.0", "end")
+        if srt_path and os.path.exists(srt_path):
+            with open(srt_path, "r", encoding="utf-8") as f:
+                self._scr_en_text.insert("1.0", f.read())
+        else:
+            self._scr_en_text.insert(
+                "1.0", "No English transcript yet.\n\nGo to ① Setup & Run "
+                       "and run the pipeline — the transcript appears here "
+                       "automatically.")
+        self._scr_en_text.config(state="disabled")
+
+        self._scr_tr_text.delete("1.0", "end")
+        if fs_path and os.path.exists(fs_path):
+            with open(fs_path, "r", encoding="utf-8") as f:
+                combined = f.read()
+            text = _extract_translation_from_finalscript(combined, lang)
+            self._scr_tr_text.insert("1.0", text or combined)
+            self._scr_status.config(text=os.path.basename(fs_path),
+                                    fg=TEXT_FAINT)
+        else:
+            self._scr_tr_text.insert(
+                "1.0", "No translation yet — run the pipeline from "
+                       "① Setup & Run.")
+            self._scr_status.config(text="", fg=TEXT_FAINT)
+
+    def _scripts_save_translation(self):
+        e = self._current_project
+        if not e:
+            self._scr_status.config(text="Open a project first.",
+                                    fg="#fbbf24")
+            return
+        _srt, fs_path = self._scripts_paths()
+        new_text = self._scr_tr_text.get("1.0", "end-1c").strip()
+        if not new_text or not fs_path:
+            self._scr_status.config(text="Nothing to save.", fg="#fbbf24")
+            return
+        lang = e.get("language", "")
+        raw_eng = ""
+        if os.path.exists(fs_path):
+            with open(fs_path, "r", encoding="utf-8") as f:
+                combined_old = f.read()
+            if combined_old.startswith("=== ENGLISH TRANSCRIPTION ==="):
+                raw_eng = combined_old.split(
+                    "=== ENGLISH TRANSCRIPTION ===", 1)[1]
+                raw_eng = raw_eng.split("===", 1)[0].strip()
+            # Version the old file before overwriting (same scheme as re-dub)
+            rev = _history_next_redub_rev(e.get("outdir", "")) - 1
+            backup = f"{e.get('base')}_FinalScript_v{max(rev, 1):02d}.txt"
+            if not os.path.exists(backup):
+                try:
+                    shutil.copy2(fs_path, backup)
+                except Exception:
+                    pass
+        header = (f"=== ENGLISH TRANSCRIPTION ===\n{raw_eng}\n\n"
+                  if raw_eng else "")
+        with open(fs_path, "w", encoding="utf-8") as f:
+            f.write(header + f"=== {lang.upper()} TRANSLATION ===\n"
+                    + new_text)
+        self._scr_status.config(text=f"✓ Saved {os.path.basename(fs_path)}",
+                                fg=TR_ACCENT)
+        self._refresh_stage_bar()
+
+    def _scripts_redub(self):
+        """Save the edited translation, then run the existing re-dub flow
+        (opens the review window, then TTS + sync — no re-translation)."""
+        e = self._current_project
+        if not e:
+            self._scr_status.config(text="Open a project first.",
+                                    fg="#fbbf24")
+            return
+        self._scripts_save_translation()
+        # Select this project's run in History and trigger the re-dub flow.
+        self._history_refresh()
+        key = (os.path.abspath(e.get("base", "")), e.get("language"))
+        for idx, h in enumerate(self._hist_entries):
+            if (os.path.abspath(h.get("base", "")), h.get("language")) == key:
+                self.hist_tree.selection_set(str(idx))
+                self.notebook.select(self.hist_tab)
+                self._history_redub_selected()
+                return
+        # Not in history yet (e.g. project created from an old folder):
+        # register it, then retry once.
+        _history_record(e.get("audio_path", ""), e.get("outdir", ""),
+                        e.get("base", ""), e.get("language", ""), "project")
+        self._history_refresh()
+        if self.hist_tree.get_children():
+            self.hist_tree.selection_set(self.hist_tree.get_children()[0])
+            self.notebook.select(self.hist_tab)
+            self._history_redub_selected()
+
+    # ─────────────────────────────────────────────────────────────────────────
     #  File picker & audio load
     # ─────────────────────────────────────────────────────────────────────────
     def _pick_file(self):
@@ -8751,6 +9431,10 @@ class EndToEndApp:
                        ("All Files", "*.*")])
         if not path:
             return
+        self._load_audio_from_path(path)
+
+    def _load_audio_from_path(self, path: str):
+        """Programmatic version of _pick_file — used by the Project Manager."""
         self.filepath = path
         short = path.replace("\\", "/").split("/")[-1]
         self.file_label.config(text=f"  {short}", fg=TEXT)

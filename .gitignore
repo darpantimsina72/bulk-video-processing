@@ -27,3 +27,6 @@ logs/
 .claude/
 github_token.txt
 feedback_outbox/
+
+# Project registry (per-machine)
+projects.json
