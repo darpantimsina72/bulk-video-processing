@@ -148,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.4.0"
+APP_VERSION  = "1.5.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -2751,6 +2751,137 @@ def _split_text_for_elevenlabs(text: str,
     return chunks
 
 
+_INDIC_FONT_CACHE = "unset"
+
+
+def _indic_matplotlib_font():
+    """First installed font family that can render Indic scripts, for
+    matplotlib text labels (DejaVu, the default, draws boxes). Cached.
+    Returns a family-name list (matplotlib accepts a fallback list) or None."""
+    global _INDIC_FONT_CACHE
+    if _INDIC_FONT_CACHE != "unset":
+        return _INDIC_FONT_CACHE
+    fams = None
+    try:
+        from matplotlib import font_manager
+        avail = {f.name for f in font_manager.fontManager.ttflist}
+        cands = ["Nirmala UI",                # Windows — most Indic scripts
+                 "Kohinoor Devanagari",       # macOS
+                 "Devanagari Sangam MN",      # macOS
+                 "Bangla Sangam MN",          # macOS — Bengali
+                 "Kohinoor Bangla",
+                 "Noto Sans Devanagari",
+                 "Noto Sans Bengali",
+                 "Arial Unicode MS"]
+        found = [c for c in cands if c in avail]
+        fams = found or None
+    except Exception:
+        fams = None
+    _INDIC_FONT_CACHE = fams
+    return fams
+
+
+# Sentence terminators: ASCII . ! ? …  plus Indic danda । and double-danda ॥
+_SENTENCE_END_RE = re.compile(r'(?<=[.!?…।॥])\s+')
+_ONLY_TAGS_RE    = re.compile(r'(?:\[[^\]]+\]\s*)+$')
+
+
+def _split_script_into_sentences(text: str) -> List[str]:
+    """
+    Split a script into sentence-level segments for per-sentence TTS.
+    Blank lines are hard paragraph breaks; single newlines inside a paragraph
+    are treated as spaces. Inline emotion tags ([calm], [pause]…) that stand
+    alone stay attached to the sentence that follows them.
+    """
+    sentences = []
+    for para in re.split(r'\n\s*\n', text):
+        para = re.sub(r'\s*\n\s*', ' ', para.strip())
+        if not para:
+            continue
+        parts = [p.strip() for p in _SENTENCE_END_RE.split(para) if p.strip()]
+        carry = ""
+        for p in parts:
+            if carry:
+                p = carry + " " + p
+                carry = ""
+            if _ONLY_TAGS_RE.fullmatch(p):
+                carry = p          # tag-only fragment → prefix of next sentence
+                continue
+            sentences.append(p)
+        if carry:                  # trailing tag-only fragment
+            if sentences:
+                sentences[-1] += " " + carry
+            else:
+                sentences.append(carry)
+    return sentences
+
+
+def _elevenlabs_tts_post(chunk: str, api_key: str, voice_id: str, model_id: str,
+                         previous_text: str = None, next_text: str = None) -> bytes:
+    """
+    Single ElevenLabs text-to-speech request → raw MP3 bytes.
+
+    previous_text / next_text enable request-stitching: when synthesizing one
+    sentence in isolation the surrounding script is sent as context so prosody
+    matches the neighbouring segments. Models that reject those fields get one
+    automatic retry without them.
+    """
+    body = {
+        "text": chunk,
+        "model_id": model_id,
+        "voice_settings": {
+            "stability": 0.35,
+            "similarity_boost": 0.80,
+            "style": 0.40,
+            "use_speaker_boost": True,
+        },
+    }
+    # ElevenLabs caps stitching context; trailing/leading 600 chars is plenty
+    # for prosody continuity without bloating the request.
+    if previous_text:
+        body["previous_text"] = previous_text[-600:]
+    if next_text:
+        body["next_text"] = next_text[:600]
+
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "audio/mpeg",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180, context=_SSL_CTX) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        if e.code in (400, 422) and (previous_text or next_text):
+            return _elevenlabs_tts_post(chunk, api_key, voice_id, model_id)
+        if e.code == 401:
+            raise ValueError("ElevenLabs rejected the API key (401). Re-paste a valid key.") from None
+        if e.code == 404:
+            raise ValueError(
+                f"ElevenLabs voice not found (404). voice_id={voice_id!r} "
+                "is not on this account. Click 'Refresh Voices' and pick "
+                "a voice from the dropdown again.") from None
+        if e.code == 422:
+            raise ValueError(
+                "ElevenLabs rejected the request (422). "
+                f"Voice may not support the target language. Details: {err_body}") from None
+        if e.code == 429:
+            raise ValueError("ElevenLabs rate limit hit (429). Try again shortly.") from None
+        raise ValueError(f"ElevenLabs TTS error (HTTP {e.code}): {err_body}") from None
+    except urllib.error.URLError as e:
+        raise ValueError(f"Network error during ElevenLabs TTS: {e.reason}") from None
+
+
 def synthesize_tts_elevenlabs(text: str, output_path: str, api_key: str,
                                voice_id: str = ELEVENLABS_TTS_VOICE_ID,
                                model_id: str = ELEVENLABS_TTS_MODEL,
@@ -2833,51 +2964,7 @@ def synthesize_tts_elevenlabs(text: str, output_path: str, api_key: str,
         # inline emotion / accent tags injected by Step4 (e.g. [bengali accent],
         # [calm], [slow], [pause]) so delivery feels human and reflective —
         # closer to a wise teacher (Sadhguru-style cadence) than a flat read.
-        payload = json.dumps({
-            "text": chunk,
-            "model_id": model_id,
-            "voice_settings": {
-                "stability": 0.35,
-                "similarity_boost": 0.80,
-                "style": 0.40,
-                "use_speaker_boost": True,
-            },
-        }, ensure_ascii=False).encode("utf-8")
-
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-        req = urllib.request.Request(
-            url, data=payload, method="POST",
-            headers={
-                "xi-api-key": api_key,
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "audio/mpeg",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=180, context=_SSL_CTX) as resp:
-                audio_bytes = resp.read()
-        except urllib.error.HTTPError as e:
-            err_body = ""
-            try:
-                err_body = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                pass
-            if e.code == 401:
-                raise ValueError("ElevenLabs rejected the API key (401). Re-paste a valid key.") from None
-            if e.code == 404:
-                raise ValueError(
-                    f"ElevenLabs voice not found (404). voice_id={voice_id!r} "
-                    "is not on this account. Click 'Refresh Voices' and pick "
-                    "a voice from the dropdown again.") from None
-            if e.code == 422:
-                raise ValueError(
-                    "ElevenLabs rejected the request (422). "
-                    f"Voice may not support the target language. Details: {err_body}") from None
-            if e.code == 429:
-                raise ValueError("ElevenLabs rate limit hit (429). Try again shortly.") from None
-            raise ValueError(f"ElevenLabs TTS error (HTTP {e.code}): {err_body}") from None
-        except urllib.error.URLError as e:
-            raise ValueError(f"Network error during ElevenLabs TTS: {e.reason}") from None
+        audio_bytes = _elevenlabs_tts_post(chunk, api_key, voice_id, model_id)
         chunk_bytes_list.append(audio_bytes)
 
         # Save individual chunk as MP3 (ElevenLabs returns MP3 bytes)
@@ -3688,6 +3775,17 @@ class EndToEndApp:
 
         # TTS-only tab state
         self._tts_tab_out_path        = ""
+        # TTS Studio sentence-segment state
+        self._tts_segments      = []      # [{text, path, start_ms, dur_ms}, …]
+        self._tts_seg_audio     = None    # merged waveform (np.float32 mono)
+        self._tts_seg_sr        = 0
+        self._tts_seg_selected  = None    # selected segment index
+        self._tts_seg_playing   = False
+        self._tts_seg_play_t0   = 0.0     # perf_counter at playback start
+        self._tts_seg_play_from = 0.0     # playback start position (s)
+        self._tts_seg_play_end  = 0.0     # playback end position (s)
+        self._tts_seg_params    = None    # TTS params of the last segment run
+        self._tts_seg_out_path  = ""      # merged output file of the last run
         self._tts_el_frame_mirror     = None
         self._tts_google_frame_mirror = None
         self._tts_voice_cb_mirror     = None
@@ -3871,6 +3969,12 @@ class EndToEndApp:
 
     # ── Single File Tab ───────────────────────────────────────────────────────
     def _build_main_tab(self):
+        """
+        Studio-style single-file tab. The main window is only: toolbar,
+        run bar, clickable pipeline stages, and one big swappable view
+        (Waveform / Log / Compare). Every setting lives in the ⚙ Settings
+        dialog, built once at startup and kept hidden.
+        """
         tab = self.main_tab
 
         # Toolbar
@@ -3881,57 +3985,80 @@ class EndToEndApp:
         toolbar.pack_propagate(False)
         self._build_toolbar(toolbar)
 
-        # ── Simple / Advanced mode ────────────────────────────────────────────
         _ui = _ui_settings_load()
         self._simple_mode_var = tk.BooleanVar(
             value=bool(_ui.get("simple_mode", True)))
         self._auto_open_var = tk.BooleanVar(
             value=bool(_ui.get("auto_open_result", True)))
 
-        self._mode_btn = self._btn(toolbar, "", self._toggle_ui_mode,
-                                   bg="#1e1b3a", fg="#a78bfa", abg="#312e81")
-        self._mode_btn.pack(side="right", padx=(4, 10), pady=8)
-        tk.Checkbutton(
-            toolbar, text="Auto-open result", variable=self._auto_open_var,
-            command=self._save_ui_settings,
-            bg=PANEL, fg=TEXT, selectcolor=PANEL3,
-            activebackground=PANEL, activeforeground=ACCENT,
-            font=(MONO_FONT, 9), cursor="hand2",
-        ).pack(side="right", padx=(4, 4), pady=8)
+        self._btn(toolbar, " ⚙ Settings ", self._open_sf_settings_dialog,
+                  bg="#1e1b3a", fg="#a78bfa", abg="#312e81").pack(
+            side="right", padx=(4, 10), pady=8)
+
+        # ── Run bar: run/cancel + view switcher + status ─────────────────────
+        run_bar = tk.Frame(tab, bg=PANEL3, height=44, bd=0,
+                           highlightbackground=PANEL_BORDER, highlightthickness=1)
+        run_bar.pack(fill="x", side="top")
+        run_bar.pack_propagate(False)
+        self._sf_run_bar = run_bar
+
+        self.btn_run_pipeline = self._btn(
+            run_bar, "▶  Run Pipeline", self._run_full_pipeline,
+            bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e")
+        self.btn_run_pipeline.pack(side="left", padx=(14, 6), pady=8)
+
+        self.btn_cancel_pipeline = self._btn(
+            run_bar, "✕  Cancel", self._cancel_pipeline,
+            bg="#1d0f0f", fg="#f87171", abg="#4d1f1f")
+        self.btn_cancel_pipeline.pack(side="left", padx=(0, 10), pady=8)
+        self.btn_cancel_pipeline.config(state="disabled")
+
+        self.api_badge = tk.Label(run_bar, text="api.txt: checking…",
+                                  bg=PANEL3, fg=TEXT_FAINT, font=(MONO_FONT, 9))
+        self.api_badge.pack(side="left", padx=(0, 12))
+
+        tk.Frame(run_bar, bg=PANEL_BORDER, width=2, height=26).pack(
+            side="left", padx=(0, 10), pady=9)
+        self._sf_view_btns = {}
+        for key, label in (("wave", " Waveform "), ("log", " Log "),
+                           ("compare", " Compare ")):
+            b = self._btn(run_bar, label,
+                          lambda k=key: self._sf_show_view(k),
+                          bg=BTN_BG, fg=TEXT_FAINT, abg=BTN_ACT)
+            b.pack(side="left", padx=2, pady=8)
+            self._sf_view_btns[key] = b
+
+        self.tr_status = tk.Label(run_bar, text="", bg=PANEL3, fg=TEXT_FAINT,
+                                  font=(MONO_FONT, 9))
+        self.tr_status.pack(side="right", padx=14)
 
         # Beginner hint bar (visible in Simple mode only)
         self._hint_bar = tk.Frame(tab, bg="#0f1d14", bd=0,
                                   highlightbackground="#14532d",
                                   highlightthickness=1)
         tk.Label(self._hint_bar,
-                 text="Quick start:   1) Paste your ElevenLabs key   →   "
-                      "2) Pick Language & Voice   →   3) Open Audio   →   "
-                      "4) ▶ Run Pipeline.    When it finishes, the result "
-                      "opens in the History tab — listen and compare there.",
+                 text="Quick start:   1) ⚙ Settings → paste your ElevenLabs "
+                      "key, pick Language & Voice   →   2) Open Audio   →   "
+                      "3) ▶ Run Pipeline.    Watch the Log while it runs — "
+                      "when it finishes, Compare shows both audios.",
                  bg="#0f1d14", fg="#4ade80", font=(MONO_FONT, 9),
                  anchor="w", justify="left",
                  ).pack(side="left", padx=14, pady=6)
 
-        # TTS Settings panel (before Regions)
-        self._build_tts_settings_panel(tab)
-
-        # English Regions panel
-        self._build_regions_panel(tab)
-
-        # Bengali Regions panel (separate defaults for TTS audio)
-        self._build_bn_regions_panel(tab)
-
-        # Translation panel
-        self._build_translation_panel(tab)
-
-        # Pipeline progress panel
+        # Pipeline progress panel (rows are clickable → preview output files)
         self._build_pipeline_panel(tab)
 
-        # Waveform
-        wave_wrapper = tk.Frame(tab, bg=BG)
-        wave_wrapper.pack(fill="both", expand=True, padx=10, pady=(4, 0))
+        # Settings dialog — holds TTS settings, region tuning and pipeline
+        # options. Built now (hidden) so all shared vars/widgets exist.
+        self._build_sf_settings_dialog()
 
-        canvas_frame = tk.Frame(wave_wrapper, bg=BG)
+        # ── Main swappable views ─────────────────────────────────────────────
+        self._sf_main = tk.Frame(tab, bg=BG)
+        self._sf_main.pack(fill="both", expand=True, padx=10, pady=(4, 0))
+
+        # Waveform view
+        self._sf_wave_view = tk.Frame(self._sf_main, bg=BG)
+        canvas_frame = tk.Frame(self._sf_wave_view, bg=BG)
         canvas_frame.pack(fill="both", expand=True)
 
         self.fig, self.ax = plt.subplots(figsize=(12, 3))
@@ -3944,7 +4071,7 @@ class EndToEndApp:
 
         self._sb_drag_start_x   = None
         self._sb_drag_start_pos = 0.0
-        self.sb_canvas = tk.Canvas(wave_wrapper, height=14, bg="#334155",
+        self.sb_canvas = tk.Canvas(self._sf_wave_view, height=14, bg="#334155",
                                    highlightthickness=0, cursor="hand2")
         self.sb_canvas.pack(fill="x", pady=(1, 2))
         self.sb_canvas.bind("<Configure>",       self._sb_on_configure)
@@ -3956,6 +4083,28 @@ class EndToEndApp:
 
         self.canvas.mpl_connect("button_press_event",  self._on_canvas_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)
+
+        # Log view — full-window pipeline log
+        self._sf_log_view = tk.Frame(self._sf_main, bg=BG)
+        log_hdr = tk.Frame(self._sf_log_view, bg=PANEL2, height=32)
+        log_hdr.pack(fill="x")
+        log_hdr.pack_propagate(False)
+        tk.Label(log_hdr, text="PIPELINE LOG", bg=PANEL2, fg="#60a5fa",
+                 font=(MONO_FONT, 9, "bold")).pack(side="left", padx=12, pady=6)
+        self._btn(log_hdr, " Clear ", self._sf_log_clear,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="right", padx=8, pady=3)
+        self._sf_log = scrolledtext.ScrolledText(
+            self._sf_log_view, wrap="word", bg="#0b1220", fg="#93c5fd",
+            insertbackground=INPUT_FG, font=(MONO_FONT, 9),
+            relief="flat", bd=0, state="disabled")
+        self._sf_log.pack(fill="both", expand=True, pady=(2, 2))
+
+        # Compare view — English on top, synced dub below, SRT text on chunks
+        self._sf_cmp_view = tk.Frame(self._sf_main, bg=BG)
+        self._sf_cmp_build(self._sf_cmp_view)
+
+        self._sf_show_view("wave")
 
         # Apply the saved Simple/Advanced layout now that all panels exist.
         self._apply_ui_mode()
@@ -3974,7 +4123,8 @@ class EndToEndApp:
 
     def _apply_ui_mode(self):
         """Simple mode hides expert-level rows (region tuning, LLM/prompt row)
-        so first-time users only see: key → voice/language → open → run."""
+        inside the ⚙ Settings dialog, and shows the beginner hint bar on the
+        main tab."""
         simple = self._simple_mode_var.get()
         try:
             self._hint_bar.pack_forget()
@@ -3983,10 +4133,11 @@ class EndToEndApp:
             self._model_row.pack_forget()
             if simple:
                 self._hint_bar.pack(fill="x", side="top",
-                                    before=self._tts_panel_frame)
+                                    after=self._sf_run_bar)
             else:
-                # Restore original order: EN regions, BN regions, then the
-                # translation panel; LLM row back at the end of that panel.
+                # Restore original order inside the Settings dialog:
+                # EN regions, BN regions, then the translation-options panel;
+                # LLM row back at the end of that panel.
                 self._regions_frame_en.pack(fill="x", side="top",
                                             before=self._tp_frame)
                 self._regions_frame_bn.pack(fill="x", side="top",
@@ -4997,33 +5148,16 @@ class EndToEndApp:
         tp.pack(fill="x", side="top")
         self._tp_frame = tp             # anchor for restoring hidden panels
 
-        # ── Button row ────────────────────────────────────────────────────────
-        row = tk.Frame(tp, bg=PANEL3, height=44)
+        # ── Header row (Run/Cancel live on the main tab's run bar) ───────────
+        row = tk.Frame(tp, bg=PANEL3, height=40)
         row.pack(fill="x")
         row.pack_propagate(False)
 
-        tk.Label(row, text="STAGE 1 — TRANSLATE", bg=PANEL3, fg=TR_ACCENT,
-                 font=(MONO_FONT, 9, "bold")).pack(side="left", padx=(14, 8), pady=12)
-        tk.Frame(row, bg="#1f4d2e", width=2, height=26).pack(side="left", padx=(0, 10), pady=9)
-
-        self.api_badge = tk.Label(row, text="api.txt: checking…",
-                                  bg=PANEL3, fg=TEXT_FAINT, font=(MONO_FONT, 9))
-        self.api_badge.pack(side="left", padx=(0, 12))
-
-        self.btn_run_pipeline = self._btn(
-            row, "▶  Run Pipeline", self._run_full_pipeline,
-            bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e")
-        self.btn_run_pipeline.pack(side="left", padx=(0, 6), pady=8)
-
-        self.btn_cancel_pipeline = self._btn(
-            row, "✕  Cancel", self._cancel_pipeline,
-            bg="#1d0f0f", fg="#f87171", abg="#4d1f1f")
-        self.btn_cancel_pipeline.pack(side="left", padx=(0, 10), pady=8)
-        self.btn_cancel_pipeline.config(state="disabled")
-
-        self.tr_status = tk.Label(row, text="", bg=PANEL3, fg=TEXT_FAINT,
-                                  font=(MONO_FONT, 9))
-        self.tr_status.pack(side="right", padx=14)
+        tk.Label(row, text="PIPELINE OPTIONS", bg=PANEL3, fg=TR_ACCENT,
+                 font=(MONO_FONT, 9, "bold")).pack(side="left", padx=(14, 8), pady=10)
+        tk.Frame(row, bg="#1f4d2e", width=2, height=26).pack(side="left", padx=(0, 10), pady=7)
+        tk.Label(row, text="These options apply to the next ▶ Run Pipeline.",
+                 bg=PANEL3, fg=TEXT_FAINT, font=(MONO_FONT, 9)).pack(side="left")
 
         # ── "Run pipeline up to" selector ─────────────────────────────────────
         step_row = tk.Frame(tp, bg=PANEL3, height=34)
@@ -5668,11 +5802,16 @@ class EndToEndApp:
                       highlightbackground="#3b82f6", highlightthickness=1)
         pp.pack(fill="x", side="top")
 
+        self._sf_pipe_frame = pp
+
         hdr = tk.Frame(pp, bg="#162032", height=28)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
         tk.Label(hdr, text="  PIPELINE PROGRESS", bg="#162032", fg="#60a5fa",
                  font=(MONO_FONT, 9, "bold")).pack(side="left", padx=14, pady=4)
+        tk.Label(hdr, text="click a stage to preview its output file",
+                 bg="#162032", fg=TEXT_FAINT, font=(MONO_FONT, 8)).pack(
+            side="right", padx=14, pady=4)
 
         body = tk.Frame(pp, bg="#162032")
         body.pack(fill="x", padx=14, pady=(0, 8))
@@ -5692,20 +5831,526 @@ class EndToEndApp:
         self._stage_labels = {}
         self._stage_desc_labels = {}
         for tag, desc, colour in stage_labels:
-            row = tk.Frame(body, bg="#162032")
+            row = tk.Frame(body, bg="#162032", cursor="hand2")
             row.pack(fill="x", pady=1)
-            tk.Label(row, text=f" [{tag}]", bg="#162032", fg=colour,
-                     font=(MONO_FONT, 9, "bold"), width=6, anchor="w").pack(side="left")
+            _tag_lbl = tk.Label(row, text=f" [{tag}]", bg="#162032", fg=colour,
+                     font=(MONO_FONT, 9, "bold"), width=6, anchor="w",
+                     cursor="hand2")
+            _tag_lbl.pack(side="left")
             _desc_lbl = tk.Label(row, text=desc, bg="#162032", fg=TEXT_FAINT,
-                     font=(MONO_FONT, 9), width=50, anchor="w")
+                     font=(MONO_FONT, 9), width=50, anchor="w", cursor="hand2")
             _desc_lbl.pack(side="left")
             self._stage_desc_labels[tag.strip()] = _desc_lbl
             var = tk.StringVar(value="—")
             lbl = tk.Label(row, textvariable=var, bg="#162032", fg=TEXT_MUTED,
-                           font=(MONO_FONT, 9), anchor="w")
+                           font=(MONO_FONT, 9), anchor="w", cursor="hand2")
             lbl.pack(side="left", fill="x", expand=True, padx=(8, 0))
             self._stage_vars[tag.strip()] = var
             self._stage_labels[tag.strip()] = lbl
+            for w in (row, _tag_lbl, _desc_lbl, lbl):
+                w.bind("<Button-1>",
+                       lambda _e, t=tag.strip(): self._sf_stage_preview(t))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Single File tab — settings dialog / views / log / stage preview / compare
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_sf_settings_dialog(self):
+        """One ⚙ Settings window for the Single File tab: TTS settings,
+        region tuning, and pipeline options. Built once at startup (hidden)
+        so all shared vars/widgets exist before the mirror panels bind."""
+        win = tk.Toplevel(self.root)
+        self._sf_settings_win = win
+        win.title("Pipeline Settings")
+        win.configure(bg=BG)
+        win.geometry("1100x560")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        win.withdraw()
+
+        top = tk.Frame(win, bg=PANEL, height=44)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        tk.Label(top, text="PIPELINE SETTINGS", bg=PANEL, fg="#a78bfa",
+                 font=(MONO_FONT, 10, "bold")).pack(side="left",
+                                                    padx=(14, 10), pady=10)
+        self._mode_btn = self._btn(top, "", self._toggle_ui_mode,
+                                   bg="#1e1b3a", fg="#a78bfa", abg="#312e81")
+        self._mode_btn.pack(side="left", padx=8, pady=6)
+        tk.Checkbutton(
+            top, text="Auto-open result", variable=self._auto_open_var,
+            command=self._save_ui_settings,
+            bg=PANEL, fg=TEXT, selectcolor=PANEL3,
+            activebackground=PANEL, activeforeground=ACCENT,
+            font=(MONO_FONT, 9), cursor="hand2",
+        ).pack(side="left", padx=10, pady=8)
+        self._btn(top, "  Close  ", win.withdraw,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="right", padx=12, pady=6)
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True)
+        self._sf_settings_body = body
+
+        self._build_tts_settings_panel(body)
+        self._build_regions_panel(body)
+        self._build_bn_regions_panel(body)
+        self._build_translation_panel(body)
+
+    def _open_sf_settings_dialog(self):
+        win = self._sf_settings_win
+        try:
+            win.deiconify()
+            win.lift()
+        except Exception:
+            pass
+
+    def _sf_show_view(self, which):
+        """Swap the main area between Waveform / Log / Compare."""
+        self._sf_active_view = which
+        for f in (self._sf_wave_view, self._sf_log_view, self._sf_cmp_view):
+            f.pack_forget()
+        target = {"wave": self._sf_wave_view,
+                  "log": self._sf_log_view,
+                  "compare": self._sf_cmp_view}.get(which, self._sf_wave_view)
+        target.pack(fill="both", expand=True)
+        for key, b in self._sf_view_btns.items():
+            try:
+                b.config(fg=_btn_fg("#a78bfa") if key == which
+                         else _btn_fg(TEXT_FAINT))
+            except Exception:
+                pass
+        if which == "compare" and not self._sf_cmp_data:
+            self._sf_cmp_load()
+
+    # ── log ──────────────────────────────────────────────────────────────────
+
+    def _sf_log_append(self, msg):
+        ts_ui = time.strftime("%H:%M:%S")
+
+        def _do():
+            try:
+                self._sf_log.config(state="normal")
+                self._sf_log.insert("end", f"[{ts_ui}] {msg}\n")
+                self._sf_log.see("end")
+                self._sf_log.config(state="disabled")
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _do)
+        except Exception:
+            pass
+        # Also append to logs/pipeline.log with an ISO timestamp.
+        try:
+            logdir = os.path.join(SCRIPT_DIR, "logs")
+            os.makedirs(logdir, exist_ok=True)
+            with open(os.path.join(logdir, "pipeline.log"), "a",
+                      encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
+    def _sf_log_clear(self):
+        try:
+            self._sf_log.config(state="normal")
+            self._sf_log.delete("1.0", "end")
+            self._sf_log.config(state="disabled")
+        except Exception:
+            pass
+
+    # ── stage → output-file preview ──────────────────────────────────────────
+
+    def _sf_run_paths(self):
+        """Expected output paths for the currently loaded audio file."""
+        fp = self.filepath
+        if not fp:
+            return None
+        stem   = os.path.splitext(os.path.basename(fp))[0]
+        base   = getattr(self, "_last_run_base", "") or ""
+        outdir = getattr(self, "_last_run_outdir", "") or ""
+        if not base or os.path.basename(base) != stem:
+            outdir = os.path.join(os.path.dirname(fp), stem)
+            base   = os.path.join(outdir, stem)
+        try:
+            lang = self._get_tts_params()[4]
+        except Exception:
+            lang = getattr(self, "_last_run_language", "") or ""
+        try:
+            tts_audio    = os.path.join(outdir, _tts_output_name(lang, fp, "_tts"))
+            synced_audio = os.path.join(outdir, _tts_output_name(lang, fp, "_synced"))
+        except Exception:
+            tts_audio = synced_audio = ""
+        return {"outdir": outdir, "base": base,
+                "tts_audio": tts_audio, "synced_audio": synced_audio}
+
+    def _sf_stage_preview(self, tag):
+        p = self._sf_run_paths()
+        if not p:
+            messagebox.showinfo("No audio", "Open an audio file first.")
+            return
+        base = p["base"]
+        MAP = {
+            "S1a": [("English SRT", base + ".srt"),
+                    ("Analyzed transcript", base + "_analyzed.txt")],
+            "S1b": [("Final script", base + "_FinalScript.txt"),
+                    ("Translation step", base + "_TranslationStep.txt"),
+                    ("Review step", base + "_ReviewStep.txt")],
+            "S2":  [("TTS audio", p["tts_audio"]),
+                    ("TTS chunk log",
+                     os.path.splitext(p["tts_audio"])[0] + "_chunks.txt"
+                     if p["tts_audio"] else "")],
+            "S3a": [("Sync — English SRT", base + "_sync_en.srt")],
+            "S3b": [("Sync — dubbed SRT", base + "_sync_te.srt")],
+            "S3c": [("SRT mapping (Gemini)", base + "_sync_mapping.txt")],
+            "S3d": [("Timing sync log", base + "_sync_log.txt"),
+                    ("Synced SRT", base + "_sync_synced.srt")],
+            "S3e": [("Synced audio", p["synced_audio"]),
+                    ("Synced SRT", base + "_sync_synced.srt"),
+                    ("Synced timestamps", base + "_sync_timestamps.txt")],
+        }
+        cands = [(lbl, pth) for lbl, pth in MAP.get(tag, [])
+                 if pth and os.path.isfile(pth)]
+        if not cands:
+            self.status.config(
+                text=f"[{tag}] No output file yet — run the pipeline first.")
+            return
+        if len(cands) == 1:
+            self._sf_preview_file(cands[0][1])
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        for lbl, pth in cands:
+            menu.add_command(
+                label=f"{lbl}  —  {os.path.basename(pth)}",
+                command=lambda q=pth: self._sf_preview_file(q))
+        try:
+            menu.tk_popup(self.root.winfo_pointerx(),
+                          self.root.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _sf_preview_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".wav", ".mp3", ".m4a", ".flac", ".ogg"):
+            self._sf_preview_audio(path)
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            messagebox.showerror("Preview", f"Could not read file:\n{e}")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(os.path.basename(path))
+        win.configure(bg=BG)
+        win.geometry("900x620")
+        win.transient(self.root)
+        bar = tk.Frame(win, bg=PANEL, height=36)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text=path, bg=PANEL, fg=TEXT_FAINT,
+                 font=(MONO_FONT, 8), anchor="w").pack(
+            side="left", fill="x", expand=True, padx=10)
+        self._btn(bar, " Open Externally ",
+                  lambda: self._sf_open_external(path),
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="right", padx=8, pady=3)
+        txt = scrolledtext.ScrolledText(
+            win, wrap="word", bg=INPUT_BG, fg=INPUT_FG,
+            font=(MONO_FONT, 10), relief="flat", bd=0)
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", content)
+        txt.config(state="disabled")
+
+    def _sf_preview_audio(self, path):
+        win = tk.Toplevel(self.root)
+        win.title(os.path.basename(path))
+        win.configure(bg=BG)
+        win.geometry("520x150")
+        win.transient(self.root)
+        info = tk.Label(win, text="Loading audio…", bg=BG, fg=TEXT_FAINT,
+                        font=(MONO_FONT, 9), anchor="w", wraplength=490,
+                        justify="left")
+        info.pack(fill="x", padx=12, pady=(12, 6))
+        state = {"y": None, "sr": 0}
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(pady=6)
+
+        def _play():
+            if state["y"] is None:
+                return
+            try:
+                sd.stop()
+                sd.play(state["y"], samplerate=state["sr"])
+            except Exception as e:
+                info.config(text=f"Playback error: {e}")
+
+        def _stop():
+            try:
+                sd.stop()
+            except Exception:
+                pass
+
+        self._btn(row, "  ▶ Play  ", _play,
+                  bg="#0f1d14", fg="#22c55e", abg="#1f4d2e").pack(
+            side="left", padx=6)
+        self._btn(row, "  ■ Stop  ", _stop,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414").pack(
+            side="left", padx=6)
+        self._btn(row, " Open Externally ",
+                  lambda: self._sf_open_external(path),
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(side="left", padx=6)
+        win.bind("<Destroy>", lambda e: _stop() if e.widget is win else None)
+
+        def _load():
+            try:
+                y, sr = librosa.load(path, sr=None, mono=True)
+                state["y"], state["sr"] = y.astype(np.float32), int(sr)
+                self.root.after(0, lambda: info.config(
+                    text=f"{os.path.basename(path)}\n"
+                         f"{len(y) / max(sr, 1):.1f}s · {sr} Hz"))
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda: info.config(
+                    text=f"Could not load audio: {err}"))
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _sf_open_external(self, path):
+        import subprocess
+        try:
+            if IS_WINDOWS:
+                os.startfile(path)          # noqa — Windows only
+            elif IS_MAC:
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as ex:
+            messagebox.showerror("Open", str(ex))
+
+    # ── compare view (English vs synced dub, SRT text on chunks) ─────────────
+
+    def _sf_cmp_build(self, parent):
+        bar = tk.Frame(parent, bg=PANEL2, height=40, bd=0,
+                       highlightbackground=PANEL_BORDER, highlightthickness=1)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self._btn(bar, " ▶ English ", lambda: self._sf_cmp_play("en"),
+                  bg="#172554", fg="#3b82f6", abg="#1e3a8a").pack(
+            side="left", padx=(10, 4), pady=6)
+        self._btn(bar, " ▶ Synced ", lambda: self._sf_cmp_play("out"),
+                  bg="#0f1d14", fg="#22c55e", abg="#1f4d2e").pack(
+            side="left", padx=4, pady=6)
+        self._btn(bar, " ■ Stop ", self._sf_cmp_stop,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414").pack(
+            side="left", padx=4, pady=6)
+        self._btn(bar, " ⟳ Reload ", self._sf_cmp_load,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=(10, 4), pady=6)
+        self._sf_cmp_info = tk.Label(
+            bar, text="Run the full pipeline — English + synced audio "
+                      "appear here. Click a chunk to hear it.",
+            bg=PANEL2, fg=TEXT_FAINT, font=(MONO_FONT, 9), anchor="w")
+        self._sf_cmp_info.pack(side="left", fill="x", expand=True, padx=10)
+
+        self._sf_cmp_fig, (self._sf_cmp_ax_top, self._sf_cmp_ax_bot) = \
+            plt.subplots(2, 1, figsize=(12, 3.6))
+        self._sf_cmp_fig.patch.set_facecolor(BG)
+        self._sf_cmp_canvas = FigureCanvasTkAgg(self._sf_cmp_fig,
+                                                master=parent)
+        w = self._sf_cmp_canvas.get_tk_widget()
+        w.configure(bg=BG, cursor="hand2")
+        w.pack(fill="both", expand=True)
+        self._sf_cmp_canvas.mpl_connect("button_press_event",
+                                        self._sf_cmp_on_click)
+        self._sf_cmp_data = {}
+        self._sf_cmp_draw()
+
+    def _sf_cmp_load(self):
+        """Load English + synced audio and their SRTs in a worker thread."""
+        p = self._sf_run_paths()
+        if not p or not self.filepath:
+            self._sf_cmp_info.config(text="Open an audio file first.")
+            return
+        en_audio  = self.filepath
+        out_audio = p["synced_audio"]
+        base      = p["base"]
+        en_srt_p  = next((q for q in (base + "_sync_en.srt", base + ".srt")
+                          if os.path.isfile(q)), None)
+        out_srt_p = next((q for q in (base + "_sync_synced.srt",
+                                      base + "_sync_te.srt")
+                          if os.path.isfile(q)), None)
+        self._sf_cmp_info.config(text="Loading audio + SRT…")
+
+        def _env_of(y, bins=3000):
+            n = len(y)
+            if n == 0:
+                return np.zeros(1, dtype=np.float32)
+            if n <= bins:
+                env = np.abs(y)
+            else:
+                step   = n // bins
+                frames = n // step
+                env = np.abs(y[:frames * step]).reshape(frames, step).max(axis=1)
+            peak = float(env.max())
+            return env / peak if peak > 0 else env
+
+        def _subs_of(srt_path):
+            """→ [(start_s, end_s, text)] — Subtitle stores milliseconds."""
+            if not srt_path:
+                return []
+            try:
+                with open(srt_path, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    d = _parse_srt_from_string(f.read())
+                return [(s.start / 1000.0, s.end / 1000.0, str(s.text))
+                        for s in sorted(d.values(), key=lambda s: s.start)]
+            except Exception:
+                return []
+
+        def _load():
+            data = {}
+            for side, apath, spath in (("en", en_audio, en_srt_p),
+                                       ("out", out_audio, out_srt_p)):
+                if not apath or not os.path.isfile(apath):
+                    continue
+                try:
+                    y, sr = librosa.load(apath, sr=None, mono=True)
+                except Exception:
+                    continue
+                y = y.astype(np.float32)
+                data[side] = {
+                    "y": y, "sr": int(sr),
+                    "dur": len(y) / max(sr, 1),
+                    "env": _env_of(y),
+                    "subs": _subs_of(spath),
+                    "title": os.path.basename(apath),
+                }
+
+            def _done():
+                self._sf_cmp_data = data
+                if not data:
+                    self._sf_cmp_info.config(
+                        text="No audio found yet — run the full pipeline first.")
+                elif "out" not in data:
+                    self._sf_cmp_info.config(
+                        text="Synced audio not found — run the FULL pipeline "
+                             "(Settings → Run pipeline up to: Full Pipeline).")
+                else:
+                    n_en  = len(data.get("en", {}).get("subs", []))
+                    n_out = len(data["out"].get("subs", []))
+                    self._sf_cmp_info.config(
+                        text=f"English: {n_en} chunks · Synced: {n_out} chunks "
+                             "· click any chunk to hear it")
+                self._sf_cmp_draw()
+            self.root.after(0, _done)
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _sf_cmp_draw(self):
+        fam = _indic_matplotlib_font()
+        specs = (
+            (self._sf_cmp_ax_top, "en",  "#3b82f6", "English (original)"),
+            (self._sf_cmp_ax_bot, "out", TR_ACCENT, "Synced dub"),
+        )
+        xmax = max([d["dur"] for d in self._sf_cmp_data.values()] or [1.0])
+        for ax, side, color, name in specs:
+            ax.clear()
+            ax.set_facecolor("#0f172a")
+            ax.tick_params(colors=TEXT, labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(GRID)
+            d = self._sf_cmp_data.get(side)
+            if not d:
+                ax.text(0.5, 0.5, f"{name} — not loaded",
+                        ha="center", va="center", transform=ax.transAxes,
+                        color=TEXT_MUTED, fontsize=9, fontfamily="monospace")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                continue
+            t = np.linspace(0, d["dur"], len(d["env"]))
+            ax.fill_between(t, -d["env"], d["env"], color=color,
+                            alpha=0.75, linewidth=0, zorder=2)
+            for k, (s0, s1, stext) in enumerate(d["subs"]):
+                ax.axvspan(s0, s1,
+                           color="#facc15" if k % 2 else "#a78bfa",
+                           alpha=0.10, zorder=1)
+                ax.axvline(s0, color="#64748b", linewidth=0.5,
+                           alpha=0.6, zorder=3)
+                label = " ".join(stext.split())
+                if len(label) > 48:
+                    label = label[:48] + "…"
+                kw = {"fontsize": 6.5, "ha": "center", "va": "top",
+                      "color": "#e2e8f0", "clip_on": True, "zorder": 4,
+                      "transform": ax.get_xaxis_transform()}
+                if fam:
+                    kw["fontfamily"] = fam
+                ax.text((s0 + s1) / 2.0, 0.98, label, **kw)
+            ax.set_ylim(-1.05, 1.05)
+            ax.set_xlim(0, xmax)
+            ax.set_yticks([])
+            ax.grid(True, axis="x", color=GRID, linewidth=0.4,
+                    linestyle="--", alpha=0.5)
+            ax.set_title(f"{name} · {d['title']} · {d['dur']:.1f}s",
+                         color=color, fontsize=8, pad=3,
+                         fontfamily="monospace", loc="left")
+
+        def fmt_time(x, _):
+            m, s2 = divmod(x, 60)
+            return f"{int(m)}:{s2:04.1f}" if m else f"{s2:.1f}s"
+        self._sf_cmp_ax_bot.xaxis.set_major_formatter(
+            ticker.FuncFormatter(fmt_time))
+        self._sf_cmp_ax_top.set_xticklabels([])
+        try:
+            self._sf_cmp_fig.tight_layout(pad=0.5)
+        except Exception:
+            pass
+        self._sf_cmp_canvas.draw()
+
+    def _sf_cmp_on_click(self, event):
+        """Click a subtitle chunk → play just that chunk + show its text."""
+        if event.xdata is None:
+            return
+        side = ("en" if event.inaxes is self._sf_cmp_ax_top else
+                "out" if event.inaxes is self._sf_cmp_ax_bot else None)
+        d = self._sf_cmp_data.get(side) if side else None
+        if not d:
+            return
+        t = float(event.xdata)
+        hit = next(((s0, s1, tx) for (s0, s1, tx) in d["subs"]
+                    if s0 <= t <= s1), None)
+        if hit is None:
+            return
+        s0, s1, stext = hit
+        sr = d["sr"]
+        chunk = d["y"][int(s0 * sr):int(s1 * sr)]
+        try:
+            sd.stop()
+            sd.play(chunk, samplerate=sr)
+        except Exception:
+            pass
+        label = " ".join(stext.split())
+        self._sf_cmp_info.config(
+            text=f"[{'EN' if side == 'en' else 'DUB'} "
+                 f"{s0:.1f}–{s1:.1f}s]  {label}")
+
+    def _sf_cmp_play(self, side):
+        d = self._sf_cmp_data.get(side)
+        if not d:
+            self._sf_cmp_info.config(text="Nothing loaded — hit ⟳ Reload.")
+            return
+        try:
+            sd.stop()
+            sd.play(d["y"], samplerate=d["sr"])
+            self._sf_cmp_info.config(
+                text=f"Playing {'English' if side == 'en' else 'synced dub'} "
+                     f"({d['dur']:.1f}s)…")
+        except Exception as e:
+            self._sf_cmp_info.config(text=f"Playback error: {e}")
+
+    def _sf_cmp_stop(self):
+        try:
+            sd.stop()
+        except Exception:
+            pass
 
     # ── Batch Tab ─────────────────────────────────────────────────────────────
     def _build_batch_tab(self):
@@ -5801,9 +6446,19 @@ class EndToEndApp:
 
     # ── TTS Tab ───────────────────────────────────────────────────────────────
     def _build_tts_tab(self):
+        """
+        Studio-style layout (modelled on ElevenLabs Studio): the main view is
+        only text + waveform timeline + transport. Every knob (API key,
+        language, platform, voices, output path, toggles) lives in one
+        ⚙ Settings dialog.
+        """
         tab = self.tts_tab
 
-        # Header bar
+        self._tts_segment_mode_var = tk.BooleanVar(
+            value=bool(_ui_settings_load().get("tts_segment_mode", True)))
+        self._tts_tab_out_label = None   # created inside the Settings dialog
+
+        # ── Header: title | status | view toggle | Generate | Settings ──────
         ctrl = tk.Frame(tab, bg=PANEL, height=54, bd=0,
                         highlightbackground=PANEL_BORDER, highlightthickness=1)
         ctrl.pack(fill="x", side="top")
@@ -5811,51 +6466,174 @@ class EndToEndApp:
         tk.Label(ctrl, text="TTS STUDIO", bg=PANEL, fg="#a78bfa",
                  font=(MONO_FONT, 10, "bold")).pack(side="left", padx=(14, 10), pady=14)
         tk.Frame(ctrl, bg="#5b4fbf", width=2, height=28).pack(side="left", padx=8, pady=12)
-        tk.Label(ctrl, text="Synthesize audio from any script — no pipeline required",
-                 bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9)).pack(side="left", padx=4)
 
-        # TTS settings (mirrored — same vars as Single File tab)
-        self._build_tts_settings_mirror(tab)
+        self._tts_view_script_btn = self._btn(
+            ctrl, " Script ", lambda: self._tts_show_view("script"),
+            bg=BTN_BG, fg="#a78bfa", abg=BTN_ACT)
+        self._tts_view_script_btn.pack(side="left", padx=(4, 2), pady=10)
+        self._tts_view_seg_btn = self._btn(
+            ctrl, " Segments ", lambda: self._tts_show_view("segments"),
+            bg=BTN_BG, fg=TEXT_FAINT, abg=BTN_ACT)
+        self._tts_view_seg_btn.pack(side="left", padx=2, pady=10)
 
-        # Output path bar
-        out_bar = tk.Frame(tab, bg=PANEL2, height=38, bd=0,
-                           highlightbackground=PANEL_BORDER, highlightthickness=1)
-        out_bar.pack(fill="x")
-        out_bar.pack_propagate(False)
-        tk.Label(out_bar, text="Output:", bg=PANEL2, fg=TEXT_FAINT,
-                 font=(MONO_FONT, 9)).pack(side="left", padx=(14, 6), pady=8)
-        self._tts_tab_out_label = tk.Label(
-            out_bar, text="No output path chosen — will be prompted on Generate",
-            bg=PANEL2, fg=TEXT_MUTED, font=(MONO_FONT, 9), anchor="w")
-        self._tts_tab_out_label.pack(side="left", fill="x", expand=True, padx=4)
-        self._btn(out_bar, "Choose Path", self._tts_tab_pick_output,
-                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(side="right", padx=10, pady=7)
+        self._tts_tab_status = tk.Label(
+            ctrl, text="Paste a script, then ▶ Generate",
+            bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9), anchor="w")
+        self._tts_tab_status.pack(side="left", fill="x", expand=True, padx=10)
 
-        # Script text area
-        text_frame = tk.Frame(tab, bg=BG)
-        text_frame.pack(fill="both", expand=True, padx=10, pady=(8, 4))
-        tk.Label(text_frame, text="Script  (text to synthesize):",
-                 bg=BG, fg=TEXT, font=(MONO_FONT, 9, "bold")).pack(anchor="w", padx=2, pady=(4, 2))
+        self._btn(ctrl, " ⚙ Settings ", self._open_tts_settings_dialog,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="right", padx=(4, 12), pady=10)
+        self._tts_tab_generate_btn = self._btn(
+            ctrl, "  ▶ Generate  ", self._tts_tab_generate,
+            bg="#0f1d14", fg="#22c55e", abg="#1f4d2e")
+        self._tts_tab_generate_btn.pack(side="right", padx=4, pady=10)
+
+        # ── Bottom (packed first so it claims the lowest strips):
+        #    waveform timeline at the very bottom, transport bar above it ────
+        wave_frame = tk.Frame(tab, bg=PANEL, bd=0,
+                              highlightbackground=PANEL_BORDER, highlightthickness=1)
+        wave_frame.pack(side="bottom", fill="x")
+        self._tts_seg_fig, self._tts_seg_ax = plt.subplots(figsize=(11, 1.7))
+        self._tts_seg_fig.patch.set_facecolor(PANEL)
+        self._tts_seg_canvas = FigureCanvasTkAgg(self._tts_seg_fig, master=wave_frame)
+        cw = self._tts_seg_canvas.get_tk_widget()
+        cw.configure(bg=PANEL, height=150, cursor="hand2")
+        cw.pack(fill="x", padx=8, pady=(2, 4))
+        self._tts_seg_canvas.mpl_connect("button_press_event",
+                                         self._tts_seg_on_wave_click)
+        self._tts_seg_draw_placeholder()
+
+        transport = tk.Frame(tab, bg=PANEL2, height=44, bd=0,
+                             highlightbackground=PANEL_BORDER, highlightthickness=1)
+        transport.pack(side="bottom", fill="x")
+        transport.pack_propagate(False)
+        self._btn(transport, " ▶ Play All ", self._tts_seg_play_all,
+                  bg="#0f1d14", fg="#22c55e", abg="#1f4d2e").pack(
+            side="left", padx=(12, 4), pady=7)
+        self._btn(transport, " ▶ Segment ", self._tts_seg_play_selected,
+                  bg="#0f1d14", fg="#22c55e", abg="#1f4d2e").pack(
+            side="left", padx=4, pady=7)
+        self._btn(transport, " ■ Stop ", self._tts_seg_stop,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=4, pady=7)
+        self._tts_seg_regen_btn = self._btn(
+            transport, " ⟳ Regenerate Selected ", self._tts_seg_regenerate,
+            bg="#2a1a0a", fg="#f59e0b", abg="#4d2f10")
+        self._tts_seg_regen_btn.pack(side="left", padx=(12, 4), pady=7)
+        self._tts_transport_time = tk.Label(
+            transport, text="0:00 / 0:00", bg=PANEL2, fg=TEXT,
+            font=(MONO_FONT, 10, "bold"))
+        self._tts_transport_time.pack(side="right", padx=14)
+
+        # ── Main area: Script view ↔ Segments (card) view ───────────────────
+        self._tts_main = tk.Frame(tab, bg=BG)
+        self._tts_main.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+
+        # Script view
+        self._tts_script_view = tk.Frame(self._tts_main, bg=BG)
+        tk.Label(self._tts_script_view, text="Script  (text to synthesize):",
+                 bg=BG, fg=TEXT, font=(MONO_FONT, 9, "bold")).pack(
+            anchor="w", padx=2, pady=(4, 2))
         self._tts_tab_text = scrolledtext.ScrolledText(
-            text_frame, wrap="word",
+            self._tts_script_view, wrap="word",
             bg=INPUT_BG, fg=INPUT_FG, insertbackground=INPUT_FG,
             font=(MONO_FONT, 10), relief="flat", bd=0,
             selectbackground="#1e3a8a", selectforeground="#f8fafc",
             height=16)
         self._tts_tab_text.pack(fill="both", expand=True, padx=0, pady=(0, 4))
 
-        # Bottom action bar
-        bot_bar = tk.Frame(tab, bg=PANEL, height=48, bd=0,
-                           highlightbackground=PANEL_BORDER, highlightthickness=1)
-        bot_bar.pack(fill="x", side="bottom")
-        bot_bar.pack_propagate(False)
-        self._tts_tab_generate_btn = self._btn(
-            bot_bar, "  ▶  Generate Audio", self._tts_tab_generate,
-            bg="#0f1d14", fg="#22c55e", abg="#1f4d2e")
-        self._tts_tab_generate_btn.pack(side="left", padx=14, pady=8)
-        self._tts_tab_status = tk.Label(
-            bot_bar, text="", bg=PANEL, fg=ACCENT, font=(MONO_FONT, 9), anchor="w")
-        self._tts_tab_status.pack(side="left", fill="x", expand=True, padx=8)
+        # Segments view — scrollable stack of sentence cards
+        self._tts_seg_view = tk.Frame(self._tts_main, bg=BG)
+        seg_cv = tk.Canvas(self._tts_seg_view, bg=BG, highlightthickness=0)
+        seg_sb = tk.Scrollbar(self._tts_seg_view, orient="vertical",
+                              command=seg_cv.yview)
+        self._tts_seg_holder = tk.Frame(seg_cv, bg=BG)
+        holder_id = seg_cv.create_window((0, 0), window=self._tts_seg_holder,
+                                         anchor="nw")
+        self._tts_seg_holder.bind(
+            "<Configure>",
+            lambda e: seg_cv.configure(scrollregion=seg_cv.bbox("all")))
+        seg_cv.bind("<Configure>",
+                    lambda e: seg_cv.itemconfigure(holder_id, width=e.width))
+        seg_cv.configure(yscrollcommand=seg_sb.set)
+        seg_sb.pack(side="right", fill="y")
+        seg_cv.pack(side="left", fill="both", expand=True)
+        self._tts_seg_cards_canvas = seg_cv
+        self._tts_seg_cards = []
+
+        self._tts_show_view("script")
+
+    def _tts_show_view(self, which):
+        """Swap the main area between the Script editor and Segment cards."""
+        self._tts_active_view = which
+        for f in (self._tts_script_view, self._tts_seg_view):
+            f.pack_forget()
+        if which == "script":
+            self._tts_script_view.pack(fill="both", expand=True)
+        else:
+            self._tts_seg_view.pack(fill="both", expand=True)
+        try:
+            self._tts_view_script_btn.config(
+                fg=_btn_fg("#a78bfa") if which == "script" else _btn_fg(TEXT_FAINT))
+            self._tts_view_seg_btn.config(
+                fg=_btn_fg("#a78bfa") if which == "segments" else _btn_fg(TEXT_FAINT))
+        except Exception:
+            pass
+
+    def _open_tts_settings_dialog(self):
+        """One ⚙ Settings window holding every TTS Studio option. Built once,
+        then hidden/shown — the mirror widgets stay alive so the shared
+        platform/voice visibility logic keeps working."""
+        win = getattr(self, "_tts_settings_win", None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        win = tk.Toplevel(self.root)
+        self._tts_settings_win = win
+        win.title("TTS Settings")
+        win.configure(bg="#1e1b3a")
+        win.geometry("920x300")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+
+        # Rows 1-2: API key bar + language/platform/model/engine/voice —
+        # bound to the SAME vars as the Single File tab.
+        self._build_tts_settings_mirror(win)
+
+        # Row 3: output path
+        out_bar = tk.Frame(win, bg="#1e1b3a", height=40)
+        out_bar.pack(fill="x")
+        out_bar.pack_propagate(False)
+        tk.Label(out_bar, text="Output:", bg="#1e1b3a", fg=TEXT_FAINT,
+                 font=(MONO_FONT, 9)).pack(side="left", padx=(14, 6), pady=9)
+        self._tts_tab_out_label = tk.Label(
+            out_bar, text=(self._tts_tab_out_path or
+                           "No output path chosen — will be prompted on Generate"),
+            bg="#1e1b3a", fg=TEXT if self._tts_tab_out_path else TEXT_MUTED,
+            font=(MONO_FONT, 9), anchor="w")
+        self._tts_tab_out_label.pack(side="left", fill="x", expand=True, padx=4)
+        self._btn(out_bar, "Choose Path", self._tts_tab_pick_output,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(side="right", padx=10, pady=6)
+
+        # Row 4: toggles
+        tog = tk.Frame(win, bg="#1e1b3a", height=40)
+        tog.pack(fill="x")
+        tog.pack_propagate(False)
+        for text, var, cmd in (
+            ("Sentence segments (fix & regenerate one sentence)",
+             self._tts_segment_mode_var, self._tts_seg_mode_changed),
+            ("Emotion enrichment (eleven_v3 audio tags)",
+             self._emotion_enabled_var, None),
+        ):
+            tk.Checkbutton(
+                tog, text=text, variable=var, command=cmd,
+                bg="#1e1b3a", fg=TEXT, selectcolor="#1e1b3a",
+                activebackground="#1e1b3a", activeforeground="#a78bfa",
+                font=(MONO_FONT, 9)).pack(side="left", padx=(14, 10), pady=8)
+        self._btn(tog, "  Close  ", win.withdraw,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(side="right", padx=12, pady=6)
 
     def _build_tts_settings_mirror(self, parent):
         """
@@ -5943,7 +6721,15 @@ class EndToEndApp:
             filetypes=[("MP3 audio", "*.mp3"), ("All files", "*.*")])
         if path:
             self._tts_tab_out_path = path
-            self._tts_tab_out_label.config(text=path, fg=TEXT)
+            self._tts_set_out_label(path)
+
+    def _tts_set_out_label(self, path):
+        lbl = getattr(self, "_tts_tab_out_label", None)
+        if lbl is not None:
+            try:
+                lbl.config(text=path, fg=TEXT)
+            except tk.TclError:
+                pass
 
     def _tts_tab_generate(self):
         script = self._tts_tab_text.get("1.0", "end").strip()
@@ -5961,7 +6747,7 @@ class EndToEndApp:
             if not out_path:
                 return
             self._tts_tab_out_path = out_path
-            self._tts_tab_out_label.config(text=out_path, fg=TEXT)
+            self._tts_set_out_label(out_path)
 
         (tts_platform, tts_lang_code, tts_voice_name, el_voice_id,
          pipeline_language, el_model) = self._get_tts_params()
@@ -5980,23 +6766,39 @@ class EndToEndApp:
         self._tts_tab_generate_btn.config(state="disabled")
         self._tts_tab_status.config(text="Starting…", fg=TEXT_FAINT)
 
+        segment_mode = bool(self._tts_segment_mode_var.get()) and PYDUB_AVAILABLE
+
         def _worker():
             try:
                 def _cb(msg):
                     self.root.after(0, lambda m=msg: self._tts_tab_status.config(text=m, fg=ACCENT))
 
                 if tts_platform == "ElevenLabs":
-                    enriched_script = (
+                    script_final = (
                         _run_emotion_enrichment(
                             script, language=pipeline_language,
                             model=GEMINI_DEFAULT_MODEL, status_cb=_cb)
                         if self._emotion_enabled_var.get() else script
                     )
-                    synthesize_tts_elevenlabs(enriched_script, out_path,
+                else:
+                    script_final = script
+
+                if segment_mode:
+                    params = {
+                        "platform": tts_platform, "api_key": api_key,
+                        "voice_id": el_voice_id, "model_id": el_model,
+                        "lang_code": tts_lang_code, "voice_name": tts_voice_name,
+                    }
+                    segs = self._tts_generate_segments_worker(
+                        script_final, out_path, params, status_cb=_cb)
+                    self.root.after(0, lambda: self._tts_segments_loaded(
+                        segs, out_path, params))
+                elif tts_platform == "ElevenLabs":
+                    synthesize_tts_elevenlabs(script_final, out_path,
                                               api_key=api_key, voice_id=el_voice_id,
                                               model_id=el_model, status_cb=_cb)
                 else:
-                    synthesize_tts(script, out_path, status_cb=_cb,
+                    synthesize_tts(script_final, out_path, status_cb=_cb,
                                    lang_code=tts_lang_code, voice_name=tts_voice_name)
 
                 self.root.after(0, lambda: self._tts_tab_status.config(
@@ -6008,6 +6810,482 @@ class EndToEndApp:
                 self.root.after(0, lambda e=err: messagebox.showerror("TTS Error", e))
             finally:
                 self.root.after(0, lambda: self._tts_tab_generate_btn.config(state="normal"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  TTS Studio — sentence segments (per-sentence regenerate & merge)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _tts_seg_mode_changed(self):
+        d = _ui_settings_load()
+        d["tts_segment_mode"] = bool(self._tts_segment_mode_var.get())
+        _ui_settings_save(d)
+
+    def _tts_seg_draw_placeholder(self):
+        ax = self._tts_seg_ax
+        ax.clear()
+        ax.set_facecolor("#0f172a")
+        ax.text(0.5, 0.5, "Generate audio — the segment timeline appears here",
+                ha="center", va="center", transform=ax.transAxes,
+                color=TEXT_MUTED, fontsize=10, fontfamily="monospace")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_edgecolor(GRID)
+        try:
+            self._tts_seg_fig.tight_layout(pad=0.4)
+        except Exception:
+            pass
+        self._tts_seg_canvas.draw()
+
+    # ── segment cards (ElevenLabs-Studio-style text blocks) ─────────────────
+
+    def _tts_seg_time_str(self, i):
+        s = self._tts_segments[i]
+        t0 = s["start_ms"] / 1000.0
+        t1 = (s["start_ms"] + s["dur_ms"]) / 1000.0
+
+        def _f(t):
+            m, sec = divmod(t, 60)
+            return f"{int(m)}:{sec:04.1f}"
+        return f"{_f(t0)}–{_f(t1)}"
+
+    def _tts_seg_card_text(self, i):
+        """Current (possibly user-edited) text of card i."""
+        try:
+            return self._tts_seg_cards[i]["text"].get("1.0", "end").strip()
+        except Exception:
+            return self._tts_segments[i]["text"]
+
+    def _tts_seg_rebuild_cards(self):
+        for c in self._tts_seg_cards:
+            try:
+                c["frame"].destroy()
+            except Exception:
+                pass
+        self._tts_seg_cards = []
+
+        def _wheel(event):
+            cv = self._tts_seg_cards_canvas
+            if event.num == 4:
+                cv.yview_scroll(-2, "units")
+            elif event.num == 5:
+                cv.yview_scroll(2, "units")
+            else:
+                step = -1 if event.delta > 0 else 1
+                cv.yview_scroll(step * 2, "units")
+            return "break"
+
+        for i, s in enumerate(self._tts_segments):
+            f = tk.Frame(self._tts_seg_holder, bg=INPUT_BG,
+                         highlightbackground=PANEL_BORDER, highlightthickness=1)
+            f.pack(fill="x", pady=3, padx=2)
+
+            left = tk.Frame(f, bg=INPUT_BG, width=76)
+            left.pack(side="left", fill="y")
+            left.pack_propagate(False)
+            num = tk.Label(left, text=f"{i + 1:02d}", bg=INPUT_BG, fg="#a78bfa",
+                           font=(MONO_FONT, 10, "bold"))
+            num.pack(anchor="w", padx=8, pady=(6, 0))
+            tlab = tk.Label(left, text=self._tts_seg_time_str(i), bg=INPUT_BG,
+                            fg=TEXT_FAINT, font=(MONO_FONT, 7))
+            tlab.pack(anchor="w", padx=8)
+
+            lines = max(2, min(5, len(s["text"]) // 80 + 1))
+            txt = tk.Text(f, height=lines, wrap="word", bg=INPUT_BG,
+                          fg=INPUT_FG, insertbackground=INPUT_FG,
+                          font=(MONO_FONT, 10), relief="flat", bd=0,
+                          selectbackground="#1e3a8a",
+                          selectforeground="#f8fafc")
+            txt.insert("1.0", s["text"])
+            txt.pack(side="left", fill="x", expand=True, padx=(4, 4), pady=6)
+
+            right = tk.Frame(f, bg=INPUT_BG)
+            right.pack(side="right", fill="y")
+            play = tk.Label(right, text="▶", bg=INPUT_BG, fg="#22c55e",
+                            font=(MONO_FONT, 11), cursor="hand2")
+            play.pack(padx=(2, 4), pady=(6, 0))
+            regen = tk.Label(right, text="⟳", bg=INPUT_BG, fg="#f59e0b",
+                             font=(MONO_FONT, 12, "bold"), cursor="hand2")
+            regen.pack(padx=(2, 4))
+
+            def _sel(_e=None, idx=i):
+                self._tts_seg_select(idx)
+
+            def _play(_e=None, idx=i):
+                self._tts_seg_select(idx)
+                self._tts_seg_play_selected()
+
+            def _regen(_e=None, idx=i):
+                self._tts_seg_select(idx)
+                self._tts_seg_regenerate()
+
+            for w in (f, left, num, tlab):
+                w.bind("<Button-1>", _sel)
+            txt.bind("<FocusIn>", _sel)
+            play.bind("<Button-1>", _play)
+            regen.bind("<Button-1>", _regen)
+            for w in (f, left, num, tlab, txt, play, regen, right):
+                w.bind("<MouseWheel>", _wheel)
+                w.bind("<Button-4>", _wheel)
+                w.bind("<Button-5>", _wheel)
+
+            self._tts_seg_cards.append(
+                {"frame": f, "left": left, "num": num, "tlab": tlab,
+                 "text": txt, "right": right, "play": play, "regen": regen})
+        self._tts_seg_update_card_styles()
+
+    def _tts_seg_update_card_styles(self):
+        for i, c in enumerate(self._tts_seg_cards):
+            sel = (i == self._tts_seg_selected)
+            border = "#5b4fbf" if sel else PANEL_BORDER
+            bg = "#1a2440" if sel else INPUT_BG
+            try:
+                c["frame"].config(highlightbackground=border,
+                                  highlightcolor=border, bg=bg)
+                for k in ("left", "num", "tlab", "right", "play", "regen"):
+                    c[k].config(bg=bg)
+                c["text"].config(bg=bg)
+            except Exception:
+                pass
+
+    def _tts_seg_refresh_times(self):
+        for i, c in enumerate(self._tts_seg_cards):
+            try:
+                c["tlab"].config(text=self._tts_seg_time_str(i))
+            except Exception:
+                pass
+
+    def _tts_seg_scroll_to_card(self, idx):
+        try:
+            n = max(len(self._tts_seg_cards), 1)
+            self._tts_seg_cards_canvas.yview_moveto(max(0.0, (idx - 1) / n))
+        except Exception:
+            pass
+
+    # ── synthesis / merge (worker-thread safe: no UI access) ────────────────
+
+    def _tts_synth_segment_file(self, text, seg_path, params,
+                                prev_text="", next_text=""):
+        """Synthesize one sentence to a WAV file at seg_path."""
+        if params["platform"] == "ElevenLabs":
+            voice_id = _sanitize_voice_id(str(params["voice_id"] or "").strip())
+            if not params["api_key"] or not voice_id:
+                raise ValueError(
+                    "ElevenLabs API key / voice missing — check TTS Settings.")
+            model_id = (params["model_id"] or ELEVENLABS_TTS_MODEL).strip() \
+                or ELEVENLABS_TTS_MODEL
+            snt = text
+            if not model_id.startswith("eleven_v3"):
+                stripped = _strip_emotion_tags(snt)
+                if stripped.strip():
+                    snt = stripped
+            # A single sentence rarely exceeds the API limit, but guard anyway.
+            pieces = _split_text_for_elevenlabs(snt) if len(snt) > 4800 else [snt]
+            combined = _AudioSegment.empty()
+            for p in pieces:
+                raw = _elevenlabs_tts_post(
+                    p, params["api_key"], voice_id, model_id,
+                    previous_text=prev_text or None,
+                    next_text=next_text or None)
+                combined += _AudioSegment.from_file(io.BytesIO(raw), format="mp3")
+            combined.export(seg_path, format="wav")
+        else:
+            synthesize_tts(text, seg_path,
+                           lang_code=params["lang_code"],
+                           voice_name=params["voice_name"])
+        return seg_path
+
+    def _tts_merge_segments(self, segs, out_path):
+        """Concatenate all segment WAVs → out_path; refresh start/dur of each."""
+        combined = _AudioSegment.empty()
+        pos = 0
+        for s in segs:
+            seg = _AudioSegment.from_file(s["path"])
+            s["start_ms"] = pos
+            s["dur_ms"]   = len(seg)
+            pos += len(seg)
+            combined += seg
+        combined.export(out_path, format="wav")
+        return out_path
+
+    def _tts_write_seg_manifest(self, segs, out_path):
+        try:
+            man = {"output": out_path,
+                   "segments": [{"index": i + 1, "text": s["text"],
+                                 "file": os.path.basename(s["path"]),
+                                 "start_ms": s["start_ms"],
+                                 "dur_ms": s["dur_ms"]}
+                                for i, s in enumerate(segs)]}
+            mpath = os.path.join(os.path.dirname(segs[0]["path"]), "manifest.json")
+            with open(mpath, "w", encoding="utf-8") as f:
+                json.dump(man, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _tts_generate_segments_worker(self, script, out_path, params,
+                                      status_cb=None):
+        sentences = _split_script_into_sentences(script)
+        if not sentences:
+            raise ValueError("Script produced no sentences to synthesize.")
+        seg_dir = os.path.splitext(out_path)[0] + "_segments"
+        os.makedirs(seg_dir, exist_ok=True)
+        segs, total = [], len(sentences)
+        for i, snt in enumerate(sentences):
+            if status_cb:
+                status_cb(f"TTS: generating sentence {i + 1} of {total}…")
+            seg_path = os.path.join(seg_dir, f"seg_{i + 1:03d}.wav")
+            prev_text = " ".join(sentences[max(0, i - 2):i])
+            next_text = " ".join(sentences[i + 1:i + 3])
+            self._tts_synth_segment_file(snt, seg_path, params,
+                                         prev_text, next_text)
+            segs.append({"text": snt, "path": seg_path,
+                         "start_ms": 0, "dur_ms": 0})
+        if status_cb:
+            status_cb("TTS: merging segments…")
+        self._tts_merge_segments(segs, out_path)
+        self._tts_write_seg_manifest(segs, out_path)
+        return segs
+
+    # ── UI state (main thread) ──────────────────────────────────────────────
+
+    def _tts_segments_loaded(self, segs, out_path, params):
+        try:
+            y, sr = librosa.load(out_path, sr=None, mono=True)
+        except Exception as e:
+            messagebox.showerror("Load error",
+                                 f"Could not load merged audio:\n{e}")
+            return
+        self._tts_segments     = segs
+        self._tts_seg_audio    = y.astype(np.float32)
+        self._tts_seg_sr       = int(sr)
+        self._tts_seg_out_path = out_path
+        self._tts_seg_params   = params
+        self._tts_seg_selected = 0 if segs else None
+        self._tts_seg_playing  = False
+
+        self._tts_seg_rebuild_cards()
+        self._tts_show_view("segments")
+        dur = len(y) / max(sr, 1)
+        self._tts_transport_time.config(text=f"0:00 / {self._tts_fmt_time(dur)}")
+        self._tts_tab_status.config(
+            text=f"{len(segs)} sentences · click a card or the timeline · "
+                 "✎ edit text, ⟳ regenerate", fg=TEXT_FAINT)
+        self._tts_seg_render_wave()
+
+    @staticmethod
+    def _tts_fmt_time(t):
+        m, sec = divmod(max(t, 0.0), 60)
+        return f"{int(m)}:{sec:04.1f}"
+
+    def _tts_seg_select(self, idx, scroll=False):
+        if idx is None or not (0 <= idx < len(self._tts_segments)):
+            return
+        self._tts_seg_selected = idx
+        self._tts_seg_update_card_styles()
+        if scroll:
+            self._tts_seg_scroll_to_card(idx)
+        self._tts_seg_render_wave()
+
+    def _tts_seg_on_wave_click(self, event):
+        if event.xdata is None or not self._tts_segments:
+            return
+        t_ms = event.xdata * 1000.0
+        for i, s in enumerate(self._tts_segments):
+            if s["start_ms"] <= t_ms < s["start_ms"] + s["dur_ms"]:
+                self._tts_seg_select(i, scroll=True)
+                return
+
+    # ── waveform ────────────────────────────────────────────────────────────
+
+    def _tts_seg_render_wave(self, cursor=None):
+        if self._tts_seg_audio is None:
+            return
+        ax = self._tts_seg_ax
+        ax.clear()
+        ax.set_facecolor("#0f172a")
+        ax.tick_params(colors=TEXT, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(GRID)
+        y, sr = self._tts_seg_audio, self._tts_seg_sr
+        dur = len(y) / max(sr, 1)
+
+        FILLS = ("#134e4a", "#1e3a5f")
+        for i, s in enumerate(self._tts_segments):
+            x0 = s["start_ms"] / 1000.0
+            x1 = x0 + s["dur_ms"] / 1000.0
+            sel = (i == self._tts_seg_selected)
+            ax.add_patch(Rectangle(
+                (x0, -1.05), x1 - x0, 2.10,
+                facecolor="#5b4fbf" if sel else FILLS[i % 2],
+                edgecolor="none", alpha=0.50 if sel else 0.35, zorder=1))
+            ax.axvline(x0, color="#a78bfa", linewidth=0.8, alpha=0.7, zorder=3)
+            ax.text((x0 + x1) / 2.0, 1.02, str(i + 1),
+                    color="#f8fafc" if sel else "#a78bfa", fontsize=7,
+                    ha="center", va="bottom", fontfamily="monospace",
+                    transform=ax.get_xaxis_transform(), clip_on=True, zorder=4)
+
+        TARGET = 1500
+        n = len(y)
+        if n > TARGET:
+            step = n // TARGET
+            frames = n // step
+            trimmed = y[:frames * step].reshape(frames, step)
+            peaks_p = trimmed.max(axis=1)
+            peaks_n = trimmed.min(axis=1)
+            t_axis  = np.linspace(0, dur, frames)
+        else:
+            peaks_p = peaks_n = y
+            t_axis  = np.linspace(0, dur, max(n, 1))
+        ax.fill_between(t_axis, peaks_p, peaks_n, color=WAVEFORM,
+                        alpha=0.85, linewidth=0, zorder=2)
+
+        if cursor is not None and 0 <= cursor <= dur:
+            ax.axvline(cursor, color=CURSOR_C, linewidth=CURSOR_W,
+                       alpha=0.95, zorder=5)
+
+        ax.set_xlim(0, max(dur, 0.01))
+        ax.set_ylim(-1.05, 1.05)
+        ax.grid(True, axis="x", color=GRID, linewidth=0.4,
+                linestyle="--", alpha=0.5)
+
+        def fmt_time(x, _):
+            m, s2 = divmod(x, 60)
+            return f"{int(m)}:{s2:04.1f}" if m else f"{s2:.1f}s"
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(fmt_time))
+        try:
+            self._tts_seg_fig.tight_layout(pad=0.4)
+        except Exception:
+            pass
+        self._tts_seg_canvas.draw()
+
+    # ── playback ────────────────────────────────────────────────────────────
+
+    def _tts_seg_play_range(self, start_s, end_s):
+        if self._tts_seg_audio is None:
+            return
+        self._tts_seg_stop()
+        sr = self._tts_seg_sr
+        chunk = self._tts_seg_audio[int(start_s * sr):int(end_s * sr)]
+        if len(chunk) == 0:
+            return
+        self._tts_seg_playing   = True
+        self._tts_seg_play_from = start_s
+        self._tts_seg_play_end  = end_s
+        self._tts_seg_play_t0   = time.perf_counter()
+
+        def _run():
+            try:
+                sd.play(chunk, samplerate=sr)
+                sd.wait()
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        self._tts_seg_tick()
+
+    def _tts_seg_tick(self):
+        if not self._tts_seg_playing:
+            return
+        pos = self._tts_seg_play_from + (time.perf_counter() - self._tts_seg_play_t0)
+        dur = (len(self._tts_seg_audio) / max(self._tts_seg_sr, 1)
+               if self._tts_seg_audio is not None else 0.0)
+        try:
+            self._tts_transport_time.config(
+                text=f"{self._tts_fmt_time(pos)} / {self._tts_fmt_time(dur)}")
+        except Exception:
+            pass
+        if pos >= self._tts_seg_play_end:
+            self._tts_seg_playing = False
+            self._tts_seg_render_wave()
+            return
+        self._tts_seg_render_wave(cursor=pos)
+        self.root.after(120, self._tts_seg_tick)
+
+    def _tts_seg_play_selected(self):
+        i = self._tts_seg_selected
+        if i is None or not self._tts_segments:
+            return
+        s = self._tts_segments[i]
+        self._tts_seg_play_range(s["start_ms"] / 1000.0,
+                                 (s["start_ms"] + s["dur_ms"]) / 1000.0)
+
+    def _tts_seg_play_all(self):
+        if self._tts_seg_audio is None:
+            return
+        self._tts_seg_play_range(
+            0.0, len(self._tts_seg_audio) / max(self._tts_seg_sr, 1))
+
+    def _tts_seg_stop(self):
+        was_playing = self._tts_seg_playing
+        self._tts_seg_playing = False
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        if was_playing and self._tts_seg_audio is not None:
+            self._tts_seg_render_wave()
+
+    # ── regenerate one sentence ─────────────────────────────────────────────
+
+    def _tts_seg_regenerate(self):
+        i = self._tts_seg_selected
+        if i is None or not self._tts_segments:
+            messagebox.showinfo("No segment",
+                                "Generate audio first, then select a sentence.")
+            return
+        if self._tts_seg_params is None:
+            return
+        new_text = self._tts_seg_card_text(i)
+        if not new_text:
+            messagebox.showwarning(
+                "Empty text",
+                "Segment text is empty — type the corrected sentence first.")
+            return
+        self._tts_seg_stop()
+        segs     = self._tts_segments
+        params   = dict(self._tts_seg_params)
+        out_path = self._tts_seg_out_path
+        seg      = segs[i]
+        self._tts_seg_regen_btn.config(state="disabled")
+        self._tts_tab_status.config(text=f"Regenerating sentence {i + 1}…",
+                                    fg=ACCENT)
+
+        def _worker():
+            try:
+                prev_text = " ".join(s["text"] for s in segs[max(0, i - 2):i])
+                next_text = " ".join(s["text"] for s in segs[i + 1:i + 3])
+                tmp_path  = seg["path"] + ".tmp.wav"
+                self._tts_synth_segment_file(new_text, tmp_path, params,
+                                             prev_text, next_text)
+                os.replace(tmp_path, seg["path"])
+                seg["text"] = new_text
+                self._tts_merge_segments(segs, out_path)
+                self._tts_write_seg_manifest(segs, out_path)
+                y, sr = librosa.load(out_path, sr=None, mono=True)
+
+                def _done():
+                    self._tts_seg_audio = y.astype(np.float32)
+                    self._tts_seg_sr    = int(sr)
+                    self._tts_seg_refresh_times()
+                    dur = len(y) / max(sr, 1)
+                    self._tts_transport_time.config(
+                        text=f"0:00 / {self._tts_fmt_time(dur)}")
+                    self._tts_seg_render_wave()
+                    self._tts_tab_status.config(
+                        text=f"✔ Sentence {i + 1} regenerated & merged → "
+                             f"{os.path.basename(out_path)}", fg=TR_ACCENT)
+                self.root.after(0, _done)
+            except Exception as exc:
+                err = str(exc)
+
+                def _fail(e=err):
+                    self._tts_tab_status.config(text=f"Error: {e}", fg="#f87171")
+                    messagebox.showerror("Regenerate Error", e)
+                self.root.after(0, _fail)
+            finally:
+                self.root.after(0, lambda: self._tts_seg_regen_btn.config(
+                    state="normal"))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -6383,9 +7661,12 @@ class EndToEndApp:
             pass
         self._cmp_info.config(text="Stopped.", fg=TEXT_FAINT)
 
-    def _show_run_result(self, base: str = None, language: str = None):
+    def _show_run_result(self, base: str = None, language: str = None,
+                         jump: bool = True):
         """Jump to the History tab and load the run's waveforms. Called on
-        pipeline / batch / re-dub completion when Auto-open result is on."""
+        pipeline / batch / re-dub completion when Auto-open result is on.
+        jump=False refreshes project state only (single-file runs now show
+        their result in the in-tab Compare view instead)."""
         # Keep project state fresh regardless of the auto-open preference.
         try:
             e = self._current_project
@@ -6396,6 +7677,8 @@ class EndToEndApp:
             self._scripts_load_project()
         except Exception:
             pass
+        if not jump:
+            return
         if not getattr(self, "_auto_open_var", None) \
                 or not self._auto_open_var.get():
             return
@@ -7543,6 +8826,15 @@ class EndToEndApp:
             self.root.after(0, lambda: self._stage_bar_pulse(tag, msg))
         except Exception:
             pass
+        # Mirror every stage update into the Log view (dedup repeats)
+        try:
+            key = (tag, str(msg))
+            if str(msg).strip() not in ("", "—") and \
+                    key != getattr(self, "_sf_last_log_key", None):
+                self._sf_last_log_key = key
+                self._sf_log_append(f"[{tag}] {msg}")
+        except Exception:
+            pass
 
     def _cancel_pipeline(self):
         self._pipeline_cancel.set()
@@ -8199,6 +9491,10 @@ class EndToEndApp:
             self._set_stage(tag, "—", TEXT_MUTED)
         self.tr_status.config(text="Running…", fg=TEXT_FAINT)
         self.status.config(text="Pipeline running — please wait…")
+        self._sf_show_view("log")
+        self._sf_log_append(
+            f"=== Pipeline started: {os.path.basename(self.filepath)} "
+            f"(up to: {self._single_stop_step.get()}) ===")
 
         filepath      = self.filepath
         regions       = list(self.regions)
@@ -8240,6 +9536,9 @@ class EndToEndApp:
                 outdir   = _prepare_output_dir(filepath)
                 base     = os.path.join(
                     outdir, os.path.splitext(os.path.basename(filepath))[0])
+                self._last_run_outdir   = outdir
+                self._last_run_base     = base
+                self._last_run_language = pipeline_language
                 srt_path = base + ".srt"
                 with open(srt_path, "w", encoding="utf-8") as f:
                     f.write(final_srt)
@@ -8505,7 +9804,11 @@ class EndToEndApp:
                     self.btn_cancel_pipeline.config(state="disabled")
                     self.tr_status.config(text="All stages complete ✓", fg=TR_ACCENT)
                     self.status.config(text=f"Done! Synced audio → {synced_path}")
-                    self._show_run_result(base, pipeline_language)
+                    self._sf_log_append(
+                        "=== Pipeline complete — opening Compare view ===")
+                    self._show_run_result(base, pipeline_language, jump=False)
+                    self._sf_show_view("compare")
+                    self._sf_cmp_load()
 
                 self.root.after(0, _on_complete)
 
@@ -8515,6 +9818,7 @@ class EndToEndApp:
                     self.btn_cancel_pipeline.config(state="disabled")
                     self.tr_status.config(text="Cancelled", fg="#f87171")
                     self.status.config(text="Pipeline cancelled.")
+                    self._sf_log_append("=== Pipeline cancelled by user ===")
                 self.root.after(0, _on_cancel)
 
             except Exception as exc:
@@ -8527,6 +9831,7 @@ class EndToEndApp:
                     self.btn_cancel_pipeline.config(state="disabled")
                     self.tr_status.config(text=f"Error: {err[:60]}", fg="#f87171")
                     self.status.config(text=f"Error: {err[:100]}")
+                    self._sf_log_append(f"=== Pipeline ERROR: {err} ===")
                     self._ensure_window_visible()
                     messagebox.showerror("Pipeline Error", f"{err}\n\n{tb[:600]}")
 
