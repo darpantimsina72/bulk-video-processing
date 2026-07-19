@@ -148,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.7.0"
+APP_VERSION  = "1.8.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -1940,6 +1940,42 @@ def _parse_timestamps_text(path: str) -> list:
     except Exception:
         return []
     return entries
+
+
+_VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg")
+
+
+def _resample_np(y, sr: int, target_sr: int):
+    """Light linear resampler (np.interp) — good enough for playback mixing."""
+    y = np.asarray(y, dtype=np.float32)
+    if sr == target_sr or len(y) == 0:
+        return y
+    n = max(1, int(round(len(y) * target_sr / float(sr))))
+    x_old = np.linspace(0.0, 1.0, num=len(y), endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n, endpoint=False)
+    return np.interp(x_new, x_old, y).astype(np.float32)
+
+
+def _load_audio_any(path: str):
+    """Load mono float32 audio from an audio OR video file → (y, sr).
+    librosa handles audio; video containers go through pydub/ffmpeg."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _VIDEO_EXTS:
+        try:
+            y, sr = librosa.load(path, sr=None, mono=True)
+            return y.astype(np.float32), int(sr)
+        except Exception:
+            pass                      # fall through to pydub
+    if not PYDUB_AVAILABLE:
+        raise ValueError(
+            f"Cannot decode {os.path.basename(path)} — pydub/ffmpeg needed "
+            "for video files.")
+    seg = _AudioSegment.from_file(path)
+    seg = seg.set_channels(1)
+    sr = seg.frame_rate
+    y = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    peak = float(1 << (8 * seg.sample_width - 1))
+    return (y / peak).astype(np.float32), int(sr)
 
 
 def _detect_regions_from_audio(y, sr, threshold_db=-42.0, hysteresis_db=6.0, min_sil_ms=150):
@@ -6456,18 +6492,27 @@ class EndToEndApp:
                        highlightbackground=PANEL_BORDER, highlightthickness=1)
         bar.pack(fill="x")
         bar.pack_propagate(False)
+        self._btn(bar, " ▶ PLAY ALL ", self._sf_cmp_toggle_all,
+                  bg="#0f1d14", fg="#4ade80", abg="#1f4d2e").pack(
+            side="left", padx=(10, 4), pady=6)
+        self._btn(bar, " ■ Stop ", self._sf_cmp_stop,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414").pack(
+            side="left", padx=4, pady=6)
         self._btn(bar, " ▶ English ", lambda: self._sf_cmp_play("en"),
                   bg="#172554", fg="#3b82f6", abg="#1e3a8a").pack(
             side="left", padx=(10, 4), pady=6)
         self._btn(bar, " ▶ Synced ", lambda: self._sf_cmp_play("out"),
                   bg="#0f1d14", fg="#22c55e", abg="#1f4d2e").pack(
             side="left", padx=4, pady=6)
-        self._btn(bar, " ■ Stop ", self._sf_cmp_stop,
-                  bg="#1f1213", fg="#f87171", abg="#3a1414").pack(
-            side="left", padx=4, pady=6)
         self._btn(bar, " ⟳ Reload ", self._sf_cmp_load,
                   bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
             side="left", padx=(10, 4), pady=6)
+        self._btn(bar, " ＋ Track ", self._sf_cmp_add_track,
+                  bg="#1e1b3a", fg="#a78bfa", abg="#312e81").pack(
+            side="left", padx=4, pady=6)
+        self._btn(bar, " ⤓ Mix ", self._sf_cmp_export_mix,
+                  bg="#0f1d20", fg="#2dd4bf", abg="#0e3a35").pack(
+            side="left", padx=4, pady=6)
         tk.Frame(bar, bg=PANEL_BORDER, width=2, height=24).pack(
             side="left", padx=(8, 8), pady=8)
         self._btn(bar, " − ", lambda: self._sf_cmp_zoom_by(0.67),
@@ -6487,8 +6532,8 @@ class EndToEndApp:
             side="left", padx=2, pady=6)
         self._sf_cmp_info = tk.Label(
             bar, text="Run the full pipeline — audio appears here. "
-                      "Click = seek · double-click a chunk = play it · "
-                      "drag a dub chunk = move it · scroll = pan · "
+                      "Space/▶ ALL = play mix · click = seek · "
+                      "double-click chunk = play it · drag chunk = move it · "
                       "ctrl+scroll = zoom",
             bg=PANEL2, fg=TEXT_FAINT, font=(MONO_FONT, 9), anchor="w")
         self._sf_cmp_info.pack(side="left", fill="x", expand=True, padx=10)
@@ -6501,6 +6546,21 @@ class EndToEndApp:
         self._sf_cmp_playing_side = None
         self._sf_cmp_play_from    = 0.0
         self._sf_cmp_play_t0      = 0.0
+
+        # Reaper-style mixer state
+        self._sf_cmp_order    = ["en", "out"]   # track display/mix order
+        self._sf_cmp_extra_n  = 0               # counter for extra track ids
+        self._sf_cmp_stream   = None            # sounddevice OutputStream
+        self._sf_cmp_mix_frame  = 0             # playback position (frames)
+        self._sf_cmp_mix_total  = 0             # end of mix (frames)
+        self._sf_cmp_mix_sr     = 48000
+        self._sf_cmp_mcur       = 0.0           # shared master cursor (s)
+
+        # Track strip (mixer rows: name · M · S · vol · pan), Reaper-style.
+        self._sf_cmp_strip = tk.Frame(parent, bg=PANEL3, bd=0,
+                                      highlightbackground=PANEL_BORDER,
+                                      highlightthickness=1)
+        self._sf_cmp_strip.pack(fill="x")
 
         # Chunk-regenerate row — appears when a dubbed chunk is selected.
         # Edit the dubbed text, then ⟳ regenerates ONLY that chunk and
@@ -6528,6 +6588,7 @@ class EndToEndApp:
 
         self._sf_cmp_fig, (self._sf_cmp_ax_top, self._sf_cmp_ax_bot) = \
             plt.subplots(2, 1, figsize=(12, 3.6))
+        self._sf_cmp_axes = [self._sf_cmp_ax_top, self._sf_cmp_ax_bot]
         self._sf_cmp_fig.patch.set_facecolor(BG)
 
         # Horizontal scrollbar (custom canvas thumb, like the Waveform view).
@@ -6619,9 +6680,53 @@ class EndToEndApp:
                     "subs": _subs_of(spath),
                     "title": os.path.basename(apath),
                 }
+                self._sf_cmp_track_defaults(data[side], side)
+
+            # Restore mixer state + extra tracks (music beds, video audio…)
+            # from <base>_tracks.json so the session survives reopen.
+            extras = []
+            saved = {}
+            try:
+                with open(base + "_tracks.json", "r", encoding="utf-8") as f:
+                    saved = json.load(f) or {}
+            except Exception:
+                saved = {}
+            for side, st in (saved.get("mixer") or {}).items():
+                if side in data and isinstance(st, dict):
+                    for k in ("gain", "pan", "mute", "solo"):
+                        if k in st:
+                            data[side][k] = st[k]
+            for i, ex in enumerate(saved.get("extras") or []):
+                path = (ex or {}).get("path", "")
+                if not path or not os.path.isfile(path):
+                    continue
+                try:
+                    ty, tsr = _load_audio_any(path)
+                except Exception:
+                    continue
+                key = f"trk{i + 1}"
+                d = {
+                    "y": ty, "sr": int(tsr),
+                    "dur": len(ty) / max(tsr, 1),
+                    "env": _env_of(ty),
+                    "subs": [],
+                    "title": os.path.basename(path),
+                }
+                self._sf_cmp_track_defaults(d, key, path=path)
+                for k in ("gain", "pan", "mute", "solo", "offset"):
+                    if k in ex:
+                        d[k] = ex[k]
+                extras.append((key, d))
 
             def _done():
+                for key, d in extras:
+                    data[key] = d
                 self._sf_cmp_data = data
+                self._sf_cmp_order = [s for s in ("en", "out") if s in data] \
+                    + [k for k, _ in extras]
+                self._sf_cmp_extra_n = len(extras)
+                self._sf_cmp_ensure_axes()
+                self._sf_cmp_strip_rebuild()
                 out_subs = data.get("out", {}).get("subs", [])
                 if keep_sel is not None and keep_sel < len(out_subs):
                     self._sf_cmp_sel = keep_sel
@@ -6641,18 +6746,77 @@ class EndToEndApp:
                     n_out = len(data["out"].get("subs", []))
                     self._sf_cmp_info.config(
                         text=f"English: {n_en} chunks · Synced: {n_out} chunks "
-                             "· click any chunk to hear it")
+                             "· ▶ PLAY ALL or space plays the mix")
                 self._sf_cmp_draw()
             self.root.after(0, _done)
         threading.Thread(target=_load, daemon=True).start()
 
+    @staticmethod
+    def _sf_cmp_track_defaults(d: dict, side: str, path: str = ""):
+        """Reaper-style per-track mixer fields."""
+        d.setdefault("gain",   1.0)      # 0.0 – 1.5
+        d.setdefault("pan",    0.0)      # -1 (L) … +1 (R)
+        d.setdefault("mute",   False)
+        d.setdefault("solo",   False)
+        d.setdefault("offset", 0.0)      # timeline offset (s) — extras only
+        d.setdefault("kind",   "extra" if side.startswith("trk") else side)
+        d.setdefault("path",   path)
+        d.setdefault("y_mix",  None)     # cache: resampled to mix SR
+        return d
+
     def _sf_cmp_view_window(self):
         """Visible time window (x0, x1, total) from zoom + scroll state."""
-        total = max([d["dur"] for d in self._sf_cmp_data.values()] or [1.0])
+        total = max([d.get("offset", 0.0) + d["dur"]
+                     for d in self._sf_cmp_data.values()] or [1.0])
         zoom  = max(1.0, self._sf_cmp_zoom)
         vis   = total / zoom
         x0    = self._sf_cmp_scroll * max(0.0, total - vis)
         return x0, x0 + vis, total
+
+    _SF_CMP_EXTRA_COLORS = ("#f59e0b", "#e879f9", "#38bdf8", "#fb7185",
+                            "#a3e635", "#fcd34d")
+
+    def _sf_cmp_color(self, side):
+        if side == "en":
+            return "#3b82f6"
+        if side == "out":
+            return TR_ACCENT
+        try:
+            i = [s for s in self._sf_cmp_order if s.startswith("trk")].index(side)
+        except ValueError:
+            i = 0
+        return self._SF_CMP_EXTRA_COLORS[i % len(self._SF_CMP_EXTRA_COLORS)]
+
+    def _sf_cmp_track_name(self, side):
+        if side == "en":
+            return "English (original)"
+        if side == "out":
+            return "Synced dub"
+        d = self._sf_cmp_data.get(side) or {}
+        return d.get("title", side)
+
+    def _sf_cmp_ensure_axes(self):
+        """Match the number of matplotlib axes to the number of tracks."""
+        n = max(1, len(self._sf_cmp_order))
+        if len(self._sf_cmp_axes) == n:
+            return
+        self._sf_cmp_fig.clear()
+        axes = self._sf_cmp_fig.subplots(n, 1)
+        if n == 1:
+            axes = [axes]
+        self._sf_cmp_axes = list(axes)
+        self._sf_cmp_ax_top = self._sf_cmp_axes[0]
+        self._sf_cmp_ax_bot = self._sf_cmp_axes[-1]
+
+    def _sf_cmp_audible(self, side) -> bool:
+        """Reaper solo/mute rules: any solo → only soloed tracks play;
+        mute always silences."""
+        d = self._sf_cmp_data.get(side)
+        if not d or d.get("mute"):
+            return False
+        solos = [s for s in self._sf_cmp_order
+                 if (self._sf_cmp_data.get(s) or {}).get("solo")]
+        return (side in solos) if solos else True
 
     @staticmethod
     def _sf_cmp_fmt(t):
@@ -6669,10 +6833,14 @@ class EndToEndApp:
         except Exception:
             px_w = 1000
         px_per_s = px_w / vis
-        specs = (
-            (self._sf_cmp_ax_top, "en",  "#3b82f6", "English (original)"),
-            (self._sf_cmp_ax_bot, "out", TR_ACCENT, "Synced dub"),
-        )
+        self._sf_cmp_ensure_axes()
+        specs = [(ax, side, self._sf_cmp_color(side),
+                  self._sf_cmp_track_name(side))
+                 for ax, side in zip(self._sf_cmp_axes, self._sf_cmp_order)]
+        if not specs:                      # nothing loaded yet — placeholders
+            specs = [(self._sf_cmp_ax_top, "en", "#3b82f6",
+                      "English (original)"),
+                     (self._sf_cmp_ax_bot, "out", TR_ACCENT, "Synced dub")]
         for ax, side, color, name in specs:
             ax.clear()
             ax.set_facecolor("#0f172a")
@@ -6688,16 +6856,30 @@ class EndToEndApp:
                 ax.set_yticks([])
                 continue
 
-            # envelope — draw only the visible slice
+            audible = self._sf_cmp_audible(side)
+            wave_alpha = 0.75 if audible else 0.22
+            off = float(d.get("offset", 0.0))
+
+            # extra tracks: draw the item box (Reaper item) at its offset
+            if d.get("kind") == "extra":
+                ax.axvspan(off, off + d["dur"], color=color,
+                           alpha=0.10, zorder=1)
+                ax.axvline(off, color=color, linewidth=1.0,
+                           alpha=0.8, zorder=3)
+
+            # envelope — draw only the visible slice (shifted by offset)
             env, dur = d["env"], d["dur"]
             n = len(env)
             if dur > 0 and n > 1:
-                i0 = max(0, int(x0 / dur * n))
-                i1 = min(n, int(min(x1, dur) / dur * n) + 1)
+                e0 = max(0.0, x0 - off)
+                e1 = min(x1 - off, dur)
+                i0 = max(0, int(e0 / dur * n))
+                i1 = min(n, int(max(e1, 0.0) / dur * n) + 1)
                 if i1 > i0:
-                    t = np.linspace(i0 / n * dur, i1 / n * dur, i1 - i0)
+                    t = np.linspace(i0 / n * dur, i1 / n * dur,
+                                    i1 - i0) + off
                     ax.fill_between(t, -env[i0:i1], env[i0:i1], color=color,
-                                    alpha=0.75, linewidth=0, zorder=2)
+                                    alpha=wave_alpha, linewidth=0, zorder=2)
 
             # subtitle chunks — visible only; label only when it fits.
             # Rows staggered (odd/even) so neighbouring labels don't collide.
@@ -6728,8 +6910,10 @@ class EndToEndApp:
                     kw["fontfamily"] = fam
                 ax.text(cx, 0.99 if k % 2 == 0 else 0.84, label, **kw)
 
-            # playhead cursor
-            cur = self._sf_cmp_cursor.get(side, 0.0)
+            # playhead cursor — one shared timeline cursor for the whole mix
+            mixing = (self._sf_cmp_playing_side == "ALL")
+            cur = self._sf_cmp_mcur if mixing \
+                else self._sf_cmp_cursor.get(side, 0.0)
             if x0 <= cur <= x1:
                 ax.axvline(cur, color=CURSOR_C, linewidth=1.5,
                            alpha=0.95, zorder=6)
@@ -6739,19 +6923,29 @@ class EndToEndApp:
             ax.set_yticks([])
             ax.grid(True, axis="x", color=GRID, linewidth=0.4,
                     linestyle="--", alpha=0.5)
-            playing = "▶ " if self._sf_cmp_playing_side == side else ""
+            playing = "▶ " if (self._sf_cmp_playing_side == side or
+                               (mixing and audible)) else ""
+            badges = ""
+            if d.get("mute"):
+                badges += "  [M]"
+            if d.get("solo"):
+                badges += "  [S]"
+            g = float(d.get("gain", 1.0))
+            if abs(g - 1.0) > 0.01:
+                badges += f"  vol {g * 100:.0f}%"
             ax.set_title(
                 f"{playing}{name} · {d['title']} · "
-                f"{self._sf_cmp_fmt(cur)} / {self._sf_cmp_fmt(dur)}",
-                color=color, fontsize=8, pad=3,
+                f"{self._sf_cmp_fmt(cur)} / {self._sf_cmp_fmt(dur)}{badges}",
+                color=color if audible else TEXT_MUTED, fontsize=8, pad=3,
                 fontfamily="monospace", loc="left")
 
         def fmt_time(x, _):
             m, s2 = divmod(x, 60)
             return f"{int(m)}:{s2:04.1f}" if m else f"{s2:.1f}s"
-        self._sf_cmp_ax_bot.xaxis.set_major_formatter(
+        self._sf_cmp_axes[-1].xaxis.set_major_formatter(
             ticker.FuncFormatter(fmt_time))
-        self._sf_cmp_ax_top.set_xticklabels([])
+        for ax in self._sf_cmp_axes[:-1]:
+            ax.set_xticklabels([])
         try:
             self._sf_cmp_fig.tight_layout(pad=0.5)
         except Exception:
@@ -6866,16 +7060,40 @@ class EndToEndApp:
     # ── compare-view mouse: click = seek, drag dub chunk = move (Reaper) ─────
 
     def _sf_cmp_on_press(self, event):
-        """Press: double-click plays the chunk; single press arms either a
-        click-seek (handled on release) or a chunk drag (handled on motion)."""
+        """Press: double-click plays the chunk/item; single press arms either
+        a click-seek (handled on release) or a drag (handled on motion)."""
         if event.xdata is None:
             return
-        side = ("en" if event.inaxes is self._sf_cmp_ax_top else
-                "out" if event.inaxes is self._sf_cmp_ax_bot else None)
+        side = next((s for ax, s in zip(self._sf_cmp_axes,
+                                        self._sf_cmp_order)
+                     if event.inaxes is ax), None)
         d = self._sf_cmp_data.get(side) if side else None
         if not d:
             return
         t = float(event.xdata)
+
+        if d.get("kind") == "extra":
+            # Extra track = one Reaper-style item spanning offset→offset+dur.
+            off = float(d.get("offset", 0.0))
+            grabbed = off <= t <= off + d["dur"]
+            if getattr(event, "dblclick", False):
+                self._sf_cmp_press = None
+                if grabbed:
+                    try:
+                        self._sf_cmp_stop()
+                        sd.play(d["y"], samplerate=d["sr"])
+                    except Exception:
+                        pass
+                    self._sf_cmp_info.config(
+                        text=f"[{d['title']}] playing item")
+                return
+            self._sf_cmp_press = {
+                "side": side, "x": t,
+                "idx": "item" if grabbed else None,
+                "moved": False, "orig": (off, off + d["dur"], d["title"]),
+            }
+            return
+
         hit_idx = next((k for k, (a0, a1, _t) in enumerate(d["subs"])
                         if a0 <= t <= a1), None)
 
@@ -6885,8 +7103,7 @@ class EndToEndApp:
                 return
             s0, s1, stext = d["subs"][hit_idx]
             try:
-                sd.stop()
-                self._sf_cmp_playing_side = None
+                self._sf_cmp_stop()
                 sd.play(d["y"][int(s0 * d["sr"]):int(s1 * d["sr"])],
                         samplerate=d["sr"])
             except Exception:
@@ -6903,12 +7120,12 @@ class EndToEndApp:
         }
 
     def _sf_cmp_on_motion(self, event):
-        """Drag a dub chunk left/right (Reaper-style item move)."""
+        """Drag a dub chunk or an extra-track item left/right (Reaper move)."""
         pr = self._sf_cmp_press
-        if (not pr or pr["side"] != "out" or pr["idx"] is None
-                or event.xdata is None):
+        if (not pr or pr["idx"] is None or event.xdata is None
+                or pr["side"] not in self._sf_cmp_data):
             return
-        d = self._sf_cmp_data.get("out")
+        d = self._sf_cmp_data.get(pr["side"])
         if not d:
             return
         dx = float(event.xdata) - pr["x"]
@@ -6921,6 +7138,20 @@ class EndToEndApp:
             px_w = 1000
         if not pr["moved"] and abs(dx) * (px_w / vis) < 5:
             return                      # ignore tiny jitter — still a click
+
+        if pr["idx"] == "item":         # extra track: live offset move
+            pr["moved"] = True
+            off0 = pr["orig"][0]
+            noff = max(0.0, off0 + dx)
+            d["offset"] = noff
+            self._sf_cmp_info.config(
+                text=f"Moving {d['title']}: {off0:.2f}s → {noff:.2f}s — "
+                     "release to keep")
+            self._sf_cmp_draw()
+            return
+
+        if pr["side"] != "out":
+            return                      # EN chunks are fixed reference
         pr["moved"] = True
         s0, s1, stext = pr["orig"]
         ns0 = max(0.0, s0 + dx)
@@ -6941,6 +7172,15 @@ class EndToEndApp:
         if not d:
             return
 
+        if pr["moved"] and pr["idx"] == "item":
+            # Extra-track item drop: keep the new offset, persist it.
+            self._sf_cmp_tracks_save()
+            self._sf_cmp_info.config(
+                text=f"{d['title']} placed at "
+                     f"{self._sf_cmp_fmt(d.get('offset', 0.0))}")
+            self._sf_cmp_draw()
+            return
+
         if pr["moved"]:
             # Chunk drag finished → rebuild the synced audio at the new spot.
             s0_old = pr["orig"][0]
@@ -6952,12 +7192,17 @@ class EndToEndApp:
             self._sf_cmp_apply_move(pr["idx"], pr["orig"], s0_new)
             return
 
-        # Plain click → seek that track's playhead (media-player style).
+        # Plain click → shared-timeline seek (one playhead, like Reaper).
         t = pr["x"]
-        hit_idx = pr["idx"]
-        was_playing = (self._sf_cmp_playing_side == side)
-        self._sf_cmp_cursor[side] = min(max(t, 0.0), d["dur"])
-        if hit_idx is not None:
+        hit_idx = pr["idx"] if pr["idx"] != "item" else None
+        was_playing_all  = (self._sf_cmp_playing_side == "ALL")
+        was_playing_side = (self._sf_cmp_playing_side == side)
+        self._sf_cmp_mcur = max(t, 0.0)
+        for s in self._sf_cmp_order:
+            ds = self._sf_cmp_data.get(s)
+            if ds:
+                self._sf_cmp_cursor[s] = min(max(t, 0.0), ds["dur"])
+        if hit_idx is not None and d.get("kind") != "extra":
             s0, s1, stext = d["subs"][hit_idx]
             label = " ".join(stext.split())
             self._sf_cmp_info.config(
@@ -6968,9 +7213,10 @@ class EndToEndApp:
                 self._sf_cmp_fill_edit(hit_idx)
         else:
             self._sf_cmp_info.config(
-                text=f"{'English' if side == 'en' else 'Dub'} "
-                     f"cursor → {self._sf_cmp_fmt(t)}")
-        if was_playing:
+                text=f"cursor → {self._sf_cmp_fmt(t)}")
+        if was_playing_all:
+            self._sf_cmp_play_all(from_t=self._sf_cmp_mcur)
+        elif was_playing_side:
             self._sf_cmp_play(side)      # live seek: restart from new cursor
         else:
             self._sf_cmp_draw()
@@ -7091,6 +7337,7 @@ class EndToEndApp:
         s0, s1, _tx = d["subs"][i]
         sr = d["sr"]
         try:
+            self._sf_cmp_stream_close()
             sd.stop()
             sd.play(d["y"][int(s0 * sr):int(s1 * sr)], samplerate=sr)
         except Exception:
@@ -7221,12 +7468,140 @@ class EndToEndApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _sf_cmp_stream_close(self):
+        st = self._sf_cmp_stream
+        self._sf_cmp_stream = None
+        if st is not None:
+            try:
+                st.abort()
+                st.close()
+            except Exception:
+                pass
+
+    def _sf_cmp_prepare_mix(self):
+        """Pick the mix sample rate and cache each track resampled to it."""
+        srs = [d["sr"] for d in self._sf_cmp_data.values()]
+        sr = max(srs) if srs else 48000
+        self._sf_cmp_mix_sr = sr
+        for d in self._sf_cmp_data.values():
+            if d.get("y_mix") is None or d.get("_mix_sr") != sr:
+                d["y_mix"] = _resample_np(d["y"], d["sr"], sr)
+                d["_mix_sr"] = sr
+
+    def _sf_cmp_play_all(self, from_t=None):
+        """Reaper-style transport: play every audible track together through
+        one sounddevice stream. Mute/Solo/Volume/Pan react live."""
+        if not self._sf_cmp_data:
+            self._sf_cmp_info.config(text="Nothing loaded — hit ⟳ Reload.")
+            return
+        self._sf_cmp_stop()
+        try:
+            self._sf_cmp_prepare_mix()
+        except Exception as e:
+            self._sf_cmp_info.config(text=f"Mix error: {e}")
+            return
+        sr = self._sf_cmp_mix_sr
+        total_s = max(d.get("offset", 0.0) + d["dur"]
+                      for d in self._sf_cmp_data.values())
+        t0 = self._sf_cmp_mcur if from_t is None else from_t
+        if t0 >= total_s - 0.05 or t0 < 0:
+            t0 = 0.0
+        self._sf_cmp_mcur      = t0
+        self._sf_cmp_mix_frame = int(t0 * sr)
+        self._sf_cmp_mix_total = int(total_s * sr) + sr // 4
+
+        def _cb(outdata, frames, _time_info, _status):
+            pos = self._sf_cmp_mix_frame
+            out = np.zeros((frames, 2), dtype=np.float32)
+            for s in list(self._sf_cmp_order):
+                d = self._sf_cmp_data.get(s)
+                if not d or not self._sf_cmp_audible(s):
+                    continue
+                y = d.get("y_mix")
+                if y is None:
+                    continue
+                off = int(float(d.get("offset", 0.0)) * sr)
+                i0 = pos - off
+                s0v, s1v = max(i0, 0), min(i0 + frames, len(y))
+                if s1v <= s0v:
+                    continue
+                g   = float(d.get("gain", 1.0))
+                pan = float(d.get("pan", 0.0))
+                seg = y[s0v:s1v]
+                o0  = s0v - i0
+                out[o0:o0 + len(seg), 0] += seg * (g * min(1.0, 1.0 - pan))
+                out[o0:o0 + len(seg), 1] += seg * (g * min(1.0, 1.0 + pan))
+            np.clip(out, -1.0, 1.0, out)
+            outdata[:] = out
+            self._sf_cmp_mix_frame = pos + frames
+            if self._sf_cmp_mix_frame >= self._sf_cmp_mix_total:
+                raise sd.CallbackStop()
+
+        def _finished():
+            try:
+                self.root.after(0, self._sf_cmp_mix_done)
+            except Exception:
+                pass
+
+        try:
+            self._sf_cmp_stream = sd.OutputStream(
+                samplerate=sr, channels=2, dtype="float32",
+                callback=_cb, finished_callback=_finished)
+            self._sf_cmp_stream.start()
+        except Exception as e:
+            self._sf_cmp_stream = None
+            self._sf_cmp_info.config(text=f"Playback error: {e}")
+            return
+        self._sf_cmp_playing_side = "ALL"
+        self._sf_cmp_info.config(
+            text=f"▶ Playing mix from {self._sf_cmp_fmt(t0)} — space/■ to "
+                 "stop · M/S/vol/pan react live")
+        self._sf_cmp_mix_tick()
+
+    def _sf_cmp_toggle_all(self):
+        if self._sf_cmp_playing_side == "ALL":
+            self._sf_cmp_stop()
+        else:
+            self._sf_cmp_play_all()
+
+    def _sf_cmp_mix_done(self):
+        """Stream drained naturally → park the playhead at the start."""
+        if self._sf_cmp_playing_side != "ALL":
+            return
+        self._sf_cmp_playing_side = None
+        self._sf_cmp_stream_close()
+        self._sf_cmp_mcur = 0.0
+        for s in self._sf_cmp_order:
+            self._sf_cmp_cursor[s] = 0.0
+        if self._sf_cmp_data:
+            self._sf_cmp_draw()
+
+    def _sf_cmp_mix_tick(self):
+        if self._sf_cmp_playing_side != "ALL":
+            return
+        sr  = max(self._sf_cmp_mix_sr, 1)
+        pos = self._sf_cmp_mix_frame / sr
+        self._sf_cmp_mcur = pos
+        for s in self._sf_cmp_order:
+            ds = self._sf_cmp_data.get(s)
+            if ds:
+                self._sf_cmp_cursor[s] = min(pos, ds["dur"])
+        # auto-follow the playhead when zoomed in
+        x0, x1, total = self._sf_cmp_view_window()
+        vis = x1 - x0
+        if pos > x1 and total > vis:
+            new_x0 = min(max(pos - vis * 0.1, 0.0), total - vis)
+            self._sf_cmp_scroll = new_x0 / (total - vis)
+        self._sf_cmp_draw()
+        self.root.after(150, self._sf_cmp_mix_tick)
+
     def _sf_cmp_play(self, side):
-        """Play a track from its playhead cursor (media-player style)."""
+        """Play a single track from its playhead cursor (media-player style)."""
         d = self._sf_cmp_data.get(side)
         if not d:
             self._sf_cmp_info.config(text="Nothing loaded — hit ⟳ Reload.")
             return
+        self._sf_cmp_stream_close()
         cur = self._sf_cmp_cursor.get(side, 0.0)
         if cur >= d["dur"] - 0.05:
             cur = 0.0
@@ -7274,19 +7649,288 @@ class EndToEndApp:
     def _sf_cmp_stop(self):
         """Pause: the playhead keeps its position — ▶ resumes from there."""
         side = self._sf_cmp_playing_side
-        if side:
+        if side == "ALL":
+            self._sf_cmp_mcur = self._sf_cmp_mix_frame / max(
+                self._sf_cmp_mix_sr, 1)
+            for s in self._sf_cmp_order:
+                ds = self._sf_cmp_data.get(s)
+                if ds:
+                    self._sf_cmp_cursor[s] = min(self._sf_cmp_mcur, ds["dur"])
+        elif side:
             pos = self._sf_cmp_play_from + (time.perf_counter()
                                             - self._sf_cmp_play_t0)
             d = self._sf_cmp_data.get(side)
             if d:
                 self._sf_cmp_cursor[side] = min(pos, d["dur"])
         self._sf_cmp_playing_side = None
+        self._sf_cmp_stream_close()
         try:
             sd.stop()
         except Exception:
             pass
         if self._sf_cmp_data:
             self._sf_cmp_draw()
+
+    # ── Reaper-style track strip (M · S · volume · pan) ──────────────────────
+
+    def _sf_cmp_strip_rebuild(self):
+        strip = self._sf_cmp_strip
+        for w in strip.winfo_children():
+            w.destroy()
+        self._sf_cmp_strip_btns = {}
+        if not self._sf_cmp_data:
+            return
+        for side in self._sf_cmp_order:
+            d = self._sf_cmp_data.get(side)
+            if not d:
+                continue
+            color = self._sf_cmp_color(side)
+            row = tk.Frame(strip, bg=PANEL3)
+            row.pack(fill="x", pady=0)
+            tk.Frame(row, bg=color, width=4, height=20).pack(
+                side="left", padx=(8, 6), pady=2)
+            name = self._sf_cmp_track_name(side)
+            if len(name) > 26:
+                name = name[:25] + "…"
+            tk.Label(row, text=name, bg=PANEL3, fg=color, width=27,
+                     anchor="w", font=(MONO_FONT, 9)).pack(side="left")
+
+            mb = tk.Button(row, text="M", width=2, relief="flat", bd=0,
+                           cursor="hand2", font=(MONO_FONT, 9, "bold"),
+                           command=lambda s=side: self._sf_cmp_toggle_ms(
+                               s, "mute"))
+            mb.pack(side="left", padx=(6, 2), pady=2)
+            sb = tk.Button(row, text="S", width=2, relief="flat", bd=0,
+                           cursor="hand2", font=(MONO_FONT, 9, "bold"),
+                           command=lambda s=side: self._sf_cmp_toggle_ms(
+                               s, "solo"))
+            sb.pack(side="left", padx=2, pady=2)
+            self._sf_cmp_strip_btns[side] = (mb, sb)
+
+            tk.Label(row, text="vol", bg=PANEL3, fg=TEXT_FAINT,
+                     font=(MONO_FONT, 8)).pack(side="left", padx=(10, 2))
+            gv = tk.Scale(row, from_=0, to=150, orient="horizontal",
+                          showvalue=False, length=110, sliderlength=14,
+                          bg=PANEL3, troughcolor="#1e293b",
+                          highlightthickness=0, bd=0,
+                          command=lambda v, s=side: self._sf_cmp_set_gain(
+                              s, float(v) / 100.0))
+            gv.set(int(float(d.get("gain", 1.0)) * 100))
+            gv.pack(side="left", pady=2)
+            gv.bind("<ButtonRelease-1>",
+                    lambda _e: self._sf_cmp_tracks_save())
+
+            tk.Label(row, text="pan", bg=PANEL3, fg=TEXT_FAINT,
+                     font=(MONO_FONT, 8)).pack(side="left", padx=(10, 2))
+            pv = tk.Scale(row, from_=-100, to=100, orient="horizontal",
+                          showvalue=False, length=80, sliderlength=14,
+                          bg=PANEL3, troughcolor="#1e293b",
+                          highlightthickness=0, bd=0,
+                          command=lambda v, s=side: self._sf_cmp_set_pan(
+                              s, float(v) / 100.0))
+            pv.set(int(float(d.get("pan", 0.0)) * 100))
+            pv.pack(side="left", pady=2)
+            pv.bind("<ButtonRelease-1>",
+                    lambda _e: self._sf_cmp_tracks_save())
+
+            if d.get("kind") == "extra":
+                tk.Button(row, text="✕", width=2, relief="flat", bd=0,
+                          cursor="hand2", font=(MONO_FONT, 9, "bold"),
+                          bg=PANEL3, fg="#f87171",
+                          activebackground="#3a1414",
+                          command=lambda s=side:
+                          self._sf_cmp_remove_track(s)).pack(
+                    side="left", padx=(10, 4))
+                tk.Label(row, text=f"@ {self._sf_cmp_fmt(d.get('offset', 0.0))}"
+                                   " (drag item to move)",
+                         bg=PANEL3, fg=TEXT_FAINT,
+                         font=(MONO_FONT, 8)).pack(side="left", padx=6)
+        self._sf_cmp_strip_sync()
+
+    def _sf_cmp_strip_sync(self):
+        """Recolour M/S buttons from track state (Reaper-style lit buttons)."""
+        for side, (mb, sb) in getattr(self, "_sf_cmp_strip_btns",
+                                      {}).items():
+            d = self._sf_cmp_data.get(side) or {}
+            mb.config(bg="#7f1d1d" if d.get("mute") else "#1e293b",
+                      fg="#fecaca" if d.get("mute") else TEXT_FAINT,
+                      activebackground="#7f1d1d")
+            sb.config(bg="#78350f" if d.get("solo") else "#1e293b",
+                      fg="#fde68a" if d.get("solo") else TEXT_FAINT,
+                      activebackground="#78350f")
+
+    def _sf_cmp_toggle_ms(self, side, field):
+        d = self._sf_cmp_data.get(side)
+        if not d:
+            return
+        d[field] = not d.get(field)
+        self._sf_cmp_strip_sync()
+        self._sf_cmp_tracks_save()
+        self._sf_cmp_draw()
+
+    def _sf_cmp_set_gain(self, side, gain):
+        d = self._sf_cmp_data.get(side)
+        if d:
+            d["gain"] = max(0.0, min(1.5, gain))
+
+    def _sf_cmp_set_pan(self, side, pan):
+        d = self._sf_cmp_data.get(side)
+        if d:
+            d["pan"] = max(-1.0, min(1.0, pan))
+
+    def _sf_cmp_tracks_save(self):
+        """Persist mixer + extra tracks → <base>_tracks.json."""
+        p = self._sf_run_paths()
+        if not p:
+            return
+        mixer = {}
+        extras = []
+        for side in self._sf_cmp_order:
+            d = self._sf_cmp_data.get(side)
+            if not d:
+                continue
+            st = {"gain": round(float(d.get("gain", 1.0)), 3),
+                  "pan": round(float(d.get("pan", 0.0)), 3),
+                  "mute": bool(d.get("mute")),
+                  "solo": bool(d.get("solo"))}
+            if d.get("kind") == "extra":
+                extras.append({**st, "path": d.get("path", ""),
+                               "offset": round(float(d.get("offset", 0.0)), 3)})
+            else:
+                mixer[side] = st
+        try:
+            with open(p["base"] + "_tracks.json", "w",
+                      encoding="utf-8") as f:
+                json.dump({"mixer": mixer, "extras": extras}, f, indent=2)
+        except Exception:
+            pass
+
+    # ── Add / remove extra tracks (audio or video), export mixdown ──────────
+
+    def _sf_cmp_add_track(self):
+        if not self._sf_cmp_data:
+            self._sf_cmp_info.config(
+                text="Load the compare view first (⟳ Reload).")
+            return
+        path = filedialog.askopenfilename(
+            title="Add track — audio or video",
+            filetypes=[("Audio / Video",
+                        "*.wav *.mp3 *.flac *.ogg *.aiff *.aif *.m4a "
+                        "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
+                       ("All Files", "*.*")])
+        if not path:
+            return
+        self._sf_cmp_info.config(
+            text=f"Loading {os.path.basename(path)}…")
+
+        def _worker():
+            try:
+                y, sr = _load_audio_any(path)
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): messagebox.showerror(
+                    "Add track", err))
+                return
+            n = len(y)
+            bins = 3000
+            if n <= bins:
+                env = np.abs(y)
+            else:
+                step = n // bins
+                env = np.abs(y[:(n // step) * step]).reshape(
+                    n // step, step).max(axis=1)
+            peak = float(env.max())
+            env = env / peak if peak > 0 else env
+            d = {"y": y, "sr": sr, "dur": n / max(sr, 1), "env": env,
+                 "subs": [], "title": os.path.basename(path)}
+
+            def _done():
+                self._sf_cmp_extra_n += 1
+                key = f"trk{self._sf_cmp_extra_n}"
+                while key in self._sf_cmp_data:
+                    self._sf_cmp_extra_n += 1
+                    key = f"trk{self._sf_cmp_extra_n}"
+                self._sf_cmp_track_defaults(d, key, path=path)
+                self._sf_cmp_data[key] = d
+                self._sf_cmp_order.append(key)
+                self._sf_cmp_ensure_axes()
+                self._sf_cmp_strip_rebuild()
+                self._sf_cmp_tracks_save()
+                self._sf_cmp_info.config(
+                    text=f"Track added: {d['title']} — drag its item to "
+                         "position it, M/S/vol/pan in the strip above")
+                self._sf_log_append(f"[Compare] ＋ track: {path}")
+                self._sf_cmp_draw()
+            self.root.after(0, _done)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _sf_cmp_remove_track(self, side):
+        d = self._sf_cmp_data.get(side)
+        if not d or d.get("kind") != "extra":
+            return
+        self._sf_cmp_stop()
+        self._sf_cmp_data.pop(side, None)
+        if side in self._sf_cmp_order:
+            self._sf_cmp_order.remove(side)
+        self._sf_cmp_ensure_axes()
+        self._sf_cmp_strip_rebuild()
+        self._sf_cmp_tracks_save()
+        self._sf_cmp_info.config(text=f"Track removed: {d.get('title', side)}")
+        self._sf_cmp_draw()
+
+    def _sf_cmp_export_mix(self):
+        """Render the current mix (mute/solo/vol/pan honoured) → WAV."""
+        if not self._sf_cmp_data:
+            self._sf_cmp_info.config(text="Nothing loaded to export.")
+            return
+        p = self._sf_run_paths()
+        if not p:
+            return
+        out_path = p["base"] + "_mix.wav"
+        self._sf_cmp_info.config(text="Rendering mixdown…")
+
+        def _worker():
+            try:
+                self._sf_cmp_prepare_mix()
+                sr = self._sf_cmp_mix_sr
+                total_s = max(d.get("offset", 0.0) + d["dur"]
+                              for d in self._sf_cmp_data.values())
+                n = int(total_s * sr) + 1
+                buf = np.zeros((n, 2), dtype=np.float32)
+                for s in list(self._sf_cmp_order):
+                    d = self._sf_cmp_data.get(s)
+                    if not d or not self._sf_cmp_audible(s):
+                        continue
+                    y = d.get("y_mix")
+                    if y is None:
+                        continue
+                    off = int(float(d.get("offset", 0.0)) * sr)
+                    end = min(off + len(y), n)
+                    if end <= off:
+                        continue
+                    g   = float(d.get("gain", 1.0))
+                    pan = float(d.get("pan", 0.0))
+                    seg = y[:end - off]
+                    buf[off:end, 0] += seg * (g * min(1.0, 1.0 - pan))
+                    buf[off:end, 1] += seg * (g * min(1.0, 1.0 + pan))
+                np.clip(buf, -1.0, 1.0, buf)
+                pcm = (buf * 32767.0).astype(np.int16)
+                import wave
+                with wave.open(out_path, "wb") as wf:
+                    wf.setnchannels(2)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(pcm.tobytes())
+
+                def _done():
+                    self._sf_cmp_info.config(
+                        text=f"Mix exported → {os.path.basename(out_path)}")
+                    self.status.config(text=f"Mix exported → {out_path}")
+                    self._sf_log_append(f"[Compare] ⤓ mixdown → {out_path}")
+                self.root.after(0, _done)
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): messagebox.showerror(
+                    "Export mix", err))
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Batch Tab ─────────────────────────────────────────────────────────────
     def _build_batch_tab(self):
@@ -11998,6 +12642,15 @@ class EndToEndApp:
     #  Playback
     # ─────────────────────────────────────────────────────────────────────────
     def _toggle_play(self):
+        # Compare view showing → space drives the Reaper-style mix transport.
+        try:
+            if (getattr(self, "_sf_active_view", "") == "compare"
+                    and self._sf_cmp_data
+                    and self.notebook.select() == str(self.main_tab)):
+                self._sf_cmp_toggle_all()
+                return
+        except Exception:
+            pass
         if self.is_playing: self._stop_playback()
         else:               self._start_playback()
 

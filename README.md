@@ -84,6 +84,24 @@ modes): TTS voice & key, region tuning, the LLM provider row and
 prompt-chain options. Untick **Auto-open result** to disable the automatic
 jump to ④ Result when a run finishes.
 
+### Reaper-style mixer (v1.8.0)
+
+The Compare view is now a small multitrack editor, modelled on REAPER:
+
+- **▶ PLAY ALL** (or **space**) plays every track together as one mix, with
+  a single shared playhead across all tracks. Click anywhere to seek — the
+  mix restarts from there while playing.
+- **Track strip** above the waveforms: per-track **M**ute, **S**olo
+  (Reaper rules: any solo silences the rest), **volume** (0–150 %) and
+  **pan** sliders — all react live during playback.
+- **＋ Track** imports extra tracks — audio *or video* files (music beds,
+  reference videos; audio is extracted via ffmpeg). Drag the item left/right
+  to position it on the timeline, ✕ in the strip removes it.
+- **⤓ Mix** renders the current mix (mute/solo/volume/pan honoured) to
+  `<project>_mix.wav`.
+- Mixer state and extra tracks persist per project in
+  `<project>_tracks.json` and are restored on reopen.
+
 ### Compare view (v1.7.0)
 
 - **Scroll left/right** with the scrollbar under the waveforms, the ◀ ▶
