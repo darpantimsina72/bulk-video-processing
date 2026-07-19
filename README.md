@@ -79,10 +79,35 @@ Inside the workspace, the **stage bar at the bottom** tracks the process:
 - **⌂ Projects** (bottom-right) returns to the project screen.
   Everything is saved automatically — close the app any time.
 
-The workspace starts in **Simple mode** (essentials only). Click
-**⚙ Show Advanced** (top-right) for region tuning, the LLM provider row and
+All options live in one **⚙ Settings** window (no more Simple/Advanced
+modes): TTS voice & key, region tuning, the LLM provider row and
 prompt-chain options. Untick **Auto-open result** to disable the automatic
 jump to ④ Result when a run finishes.
+
+### Compare view (v1.7.0)
+
+- **Scroll left/right** with the scrollbar under the waveforms, the ◀ ▶
+  buttons, or the mouse wheel; **ctrl+wheel** zooms.
+- **Drag a dub chunk** left/right (Reaper-style) to nudge its timing — on
+  release the synced audio and SRT are rebuilt at the new position. A
+  one-time `_backup.wav` of the original synced audio is kept next to it.
+- Reopening an old project now restores the waveform, stage ticks and the
+  Compare view automatically.
+
+### 🎭 Multi-speaker dubbing (v1.7.0)
+
+Click **🎭 Speakers** (next to ▶ Run Pipeline) after the translation exists.
+Each paragraph of the translated script gets a voice dropdown — leave it on
+*default voice* or pick any ElevenLabs voice per paragraph (e.g. narrator vs
+interviewee). Saved per project (`<base>_speakers.json`) and honoured by
+▶ Run Pipeline and 🔁 Re-Dub.
+
+### Better syncing (v1.7.0)
+
+Sections that don't fit their English slot are no longer force-fit/pushed to
+odd positions: they start exactly at their English start and bleed into the
+following gap at natural pace, and an order-preserving sweep guarantees
+chunks never overlap. Fine-tune by dragging chunks in Compare.
 
 ## Updating the app
 

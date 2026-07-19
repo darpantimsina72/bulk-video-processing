@@ -148,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.6.0"
+APP_VERSION  = "1.7.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -456,6 +456,11 @@ def _prepare_output_dir(audio_path: str) -> str:
     """
     src_dir   = os.path.dirname(os.path.abspath(audio_path))
     base_name = os.path.splitext(os.path.basename(audio_path))[0]
+    # Already inside its own output folder (e.g. a reopened project whose
+    # audio is the copy that lives in the results dir) — reuse it. Creating
+    # a sibling again would nest folder/folder/folder… one level per re-run.
+    if os.path.basename(src_dir) == base_name:
+        return src_dir
     out_dir   = os.path.join(src_dir, base_name)
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -1915,6 +1920,28 @@ def _format_timestamps_as_text(timestamps: list) -> str:
     return '\n'.join(lines)
 
 
+def _parse_timestamps_text(path: str) -> list:
+    """Inverse of _format_timestamps_as_text — read a *_sync_timestamps.txt
+    file back into the list-of-dicts shape sync_audio_with_timestamps()
+    expects. Returns [] when the file is missing or unparsable."""
+    entries = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"\[(\d+)\]\s+\[(\d+)ms\]\s+\[(\d+)ms\]\s+"
+                             r"\[\d+ms\]\s+\[(\d+)ms\]", line.strip())
+                if m:
+                    entries.append({
+                        "index":           int(m.group(1)),
+                        "orig_start_ms":   int(m.group(2)),
+                        "orig_end_ms":     int(m.group(3)),
+                        "synced_start_ms": int(m.group(4)),
+                    })
+    except Exception:
+        return []
+    return entries
+
+
 def _detect_regions_from_audio(y, sr, threshold_db=-42.0, hysteresis_db=6.0, min_sil_ms=150):
     hop   = max(1, int(sr * 0.010))
     win   = hop * 2
@@ -3009,6 +3036,137 @@ def synthesize_tts_elevenlabs(text: str, output_path: str, api_key: str,
     return output_path
 
 
+# ─── Multi-speaker dubbing ────────────────────────────────────────────────────
+# Per-project map of paragraph-index → ElevenLabs voice. Saved next to the
+# other pipeline outputs as <base>_speakers.json so it travels with the
+# project and is reused on every re-run / re-dub.
+
+def _speakers_file_path(base: str) -> str:
+    return base + "_speakers.json"
+
+
+def _speakers_load(base: str) -> dict:
+    try:
+        with open(_speakers_file_path(base), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _speakers_save(base: str, d: dict) -> None:
+    with open(_speakers_file_path(base), "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+def _speakers_voice_map(base: str) -> Dict[int, str]:
+    """{paragraph_index: voice_id} for every valid saved assignment."""
+    out: Dict[int, str] = {}
+    for k, v in (_speakers_load(base).get("assignments") or {}).items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        vid = _sanitize_voice_id((v or {}).get("voice_id", ""))
+        if vid:
+            out[idx] = vid
+    return out
+
+
+def synthesize_tts_elevenlabs_multi(paragraphs: List[str],
+                                    voice_map: Dict[int, str],
+                                    output_path: str, api_key: str,
+                                    default_voice_id: str,
+                                    model_id: str = ELEVENLABS_TTS_MODEL,
+                                    status_cb=None, enrich_cb=None) -> str:
+    """Multi-speaker ElevenLabs TTS: each paragraph is voiced by
+    voice_map.get(index, default_voice_id); consecutive paragraphs that share
+    a voice are synthesized together (fewer API calls, natural flow), and all
+    pieces are concatenated in order into one WAV at output_path.
+
+    enrich_cb (optional): called once per same-voice group with the group's
+    text — used for emotion enrichment so paragraph indices stay stable."""
+    if not api_key or not api_key.strip():
+        raise ValueError("ElevenLabs API key is missing — paste it in the TTS Settings panel.")
+    default_voice_id = _sanitize_voice_id(default_voice_id)
+    if not default_voice_id:
+        raise ValueError("No valid default ElevenLabs voice selected.")
+    paragraphs = [p for p in (paragraphs or []) if p and p.strip()]
+    if not paragraphs:
+        raise ValueError("TTS text is empty — nothing to synthesize.")
+    model_id = (model_id or ELEVENLABS_TTS_MODEL).strip() or ELEVENLABS_TTS_MODEL
+
+    # Group consecutive paragraphs by their assigned voice.
+    groups: List[Tuple[str, List[str]]] = []
+    for i, para in enumerate(paragraphs):
+        vid = _sanitize_voice_id(voice_map.get(i, "")) or default_voice_id
+        if groups and groups[-1][0] == vid:
+            groups[-1][1].append(para)
+        else:
+            groups.append((vid, [para]))
+
+    out_base        = os.path.splitext(output_path)[0]
+    chunk_log_lines = [
+        f"TTS Chunk Log — {os.path.basename(output_path)} (multi-speaker)",
+        f"Platform : ElevenLabs",
+        f"Model    : {model_id}",
+        f"Speakers : {len({g[0] for g in groups})} distinct voice(s), "
+        f"{len(groups)} group(s)",
+        "",
+    ]
+    chunk_bytes_list = []
+    n_chunk = 0
+    for g_no, (vid, paras) in enumerate(groups, 1):
+        text = "\n\n".join(paras)
+        if enrich_cb:
+            try:
+                enriched = enrich_cb(text)
+                if enriched and enriched.strip():
+                    text = enriched
+            except Exception:
+                pass
+        if not model_id.startswith("eleven_v3"):
+            stripped = _strip_emotion_tags(text)
+            if stripped.strip():
+                text = stripped
+        chunks = _split_text_for_elevenlabs(text)
+        for chunk in chunks:
+            n_chunk += 1
+            if status_cb:
+                status_cb(f"TTS: speaker group {g_no}/{len(groups)} "
+                          f"(voice …{vid[-6:]}) — chunk {n_chunk}…")
+            audio_bytes = _elevenlabs_tts_post(chunk, api_key, vid, model_id)
+            chunk_bytes_list.append(audio_bytes)
+            chunk_audio_path = f"{out_base}_chunk_{n_chunk:02d}.mp3"
+            with open(chunk_audio_path, "wb") as cf:
+                cf.write(audio_bytes)
+            chunk_log_lines += [
+                f"=== CHUNK {n_chunk} · group {g_no} · voice {vid} ===",
+                f"Characters : {len(chunk)}",
+                f"Audio saved : {os.path.basename(chunk_audio_path)}",
+                "--- Text ---",
+                chunk,
+                "",
+            ]
+
+    with open(out_base + "_chunks.txt", "w", encoding="utf-8") as lf:
+        lf.write("\n".join(chunk_log_lines))
+
+    if status_cb:
+        status_cb(f"TTS: Saving → {os.path.basename(output_path)}… "
+                  f"({n_chunk} chunks, {len(groups)} speaker groups joined)")
+    try:
+        from pydub import AudioSegment
+        combined = AudioSegment.empty()
+        for raw in chunk_bytes_list:
+            combined += AudioSegment.from_file(io.BytesIO(raw), format="mp3")
+        combined.export(output_path, format="wav")
+    except ImportError:
+        with open(output_path, "wb") as f:
+            for raw in chunk_bytes_list:
+                f.write(raw)
+    return output_path
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Sync algorithm helpers (from Audio_File_Sync_New.py)
@@ -3442,11 +3600,12 @@ def _process_overflow(mappings, en_subs, te, processed, log_lines=None,
         valid = [i for i in mg.en if i in en_subs]
         if valid: en_starts[mg.no] = min(en_subs[i].start for i in valid)
 
-    # Sections WITH a valid English anchor are force-fitted onto the English
-    # timeline (at their English start, pushed forward just enough to not
-    # start on top of already-placed audio). The old behaviour — shoving
-    # them past the END of the English audio — made the dub sound completely
-    # out of sync whenever a few sections failed the fit rules.
+    # Sections WITH a valid English anchor are placed directly at their
+    # English start and allowed to BLEED OVER into the next slot (ported
+    # from fast-syncs). No compression, no shoving past placed audio — the
+    # order-preserving sweep that runs after placement resolves overlaps by
+    # nudging later clips forward, which keeps speech at natural pace and
+    # as close to its English timing as physically possible.
     anchored = sorted(
         [mg for mg in mappings if mg.no not in processed and mg.no in en_starts],
         key=lambda mg: en_starts[mg.no])
@@ -3454,36 +3613,22 @@ def _process_overflow(mappings, en_subs, te, processed, log_lines=None,
     orphans = [mg for mg in mappings
                if mg.no not in processed and mg.no not in en_starts]
 
-    placed_idx = {i for m2 in mappings if m2.no in processed
-                  for i in _te_valid(m2, te)}
-
     for mg in anchored:
         te_v = _te_valid(mg, te)
         if not te_v:
             processed.add(mg.no)
             continue
-        want    = en_starts[mg.no]
-        sec_len = _te_len(mg, te)
-        # First-fit: earliest overlap-free position at/after the English
-        # start, walking past already-placed audio blocks.
-        ds = want
-        for a, b in sorted((te[i].start, te[i].end) for i in placed_idx):
-            if b <= ds:
-                continue
-            if a >= ds + sec_len + MIN_SPRING:
-                break
-            ds = b + MIN_SPRING
+        want = en_starts[mg.no]
         te_before = {i: te[i].start for i in te_v} if log_lines is not None else {}
-        _align_start(mg, te, ds)
-        placed_idx.update(te_v)
+        _align_start(mg, te, want)
         processed.add(mg.no)
         if log_lines is not None:
             te_info = "  ".join(
                 f"TE{i}:{te_before[i]:.2f}s→{te[i].start:.2f}s" for i in te_v)
-            pushed = "" if ds == want else f" (pushed +{(ds-want)/1000.0:.2f}s)"
             log_lines.append(
-                f"  Sec {mg.no:>3} [{mg.mtype:<5}]  force-fit at EN start "
-                f"{want/1000.0:.2f}s{pushed}  {te_info}  [force-fit]")
+                f"  Sec {mg.no:>3} [{mg.mtype:<5}]  anchored at EN start "
+                f"{want/1000.0:.2f}s (may bleed into the next slot)  "
+                f"{te_info}  [bleed-over]")
 
     if orphans and log_lines is not None:
         log_lines.append(
@@ -3556,6 +3701,25 @@ def run_sync_from_strings(en_srt_text, te_srt_text, mapping_text,
         _process_overflow(mappings, en_subs, te, processed,
                           log_lines=log_lines,
                           en_audio_duration=en_audio_duration)
+    # Order-preserving sweep (ported from fast-syncs): dubbed clips must stay
+    # in recording order and must never overlap — overlapping segments get
+    # mixed on top of each other in the final audio and sound garbled. Walk
+    # the clips in recording order and nudge any offender forward.
+    ordered_ids = sorted(te.keys())
+    n_pushed, prev_end = 0, None
+    for i in ordered_ids:
+        if prev_end is not None and te[i].start < prev_end + MIN_SPRING:
+            delta = (prev_end + MIN_SPRING) - te[i].start
+            te[i].shift(delta)
+            if delta > 1.0:
+                n_pushed += 1
+                log_lines.append(
+                    f"  sweep: TE{i} +{delta/1000.0:.2f}s "
+                    "(keep order / avoid overlap)")
+        prev_end = te[i].end
+    if n_pushed:
+        log_lines.append(
+            f"\n--- Order sweep: {n_pushed} subtitle(s) nudged forward ---")
     log_lines.append(f"\n=== Complete: {len(processed)}/{len(mappings)} sections synced ===")
     all_te_idx = {i for mg in mappings for i in mg.te}
     synced = {i: te[i] for i in sorted(all_te_idx) if i in te}
@@ -4039,8 +4203,6 @@ class EndToEndApp:
         self._build_toolbar(toolbar)
 
         _ui = _ui_settings_load()
-        self._simple_mode_var = tk.BooleanVar(
-            value=bool(_ui.get("simple_mode", True)))
         self._auto_open_var = tk.BooleanVar(
             value=bool(_ui.get("auto_open_result", True)))
 
@@ -4066,6 +4228,10 @@ class EndToEndApp:
         self.btn_cancel_pipeline.pack(side="left", padx=(0, 10), pady=8)
         self.btn_cancel_pipeline.config(state="disabled")
 
+        self._btn(run_bar, "🎭 Speakers", self._open_speakers_dialog,
+                  bg="#1e1b3a", fg="#a78bfa", abg="#312e81").pack(
+            side="left", padx=(0, 10), pady=8)
+
         self.api_badge = tk.Label(run_bar, text="api.txt: checking…",
                                   bg=PANEL3, fg=TEXT_FAINT, font=(MONO_FONT, 9))
         self.api_badge.pack(side="left", padx=(0, 12))
@@ -4084,19 +4250,6 @@ class EndToEndApp:
         self.tr_status = tk.Label(run_bar, text="", bg=PANEL3, fg=TEXT_FAINT,
                                   font=(MONO_FONT, 9))
         self.tr_status.pack(side="right", padx=14)
-
-        # Beginner hint bar (visible in Simple mode only)
-        self._hint_bar = tk.Frame(tab, bg="#0f1d14", bd=0,
-                                  highlightbackground="#14532d",
-                                  highlightthickness=1)
-        tk.Label(self._hint_bar,
-                 text="Quick start:   1) ⚙ Settings → paste your ElevenLabs "
-                      "key, pick Language & Voice   →   2) Open Audio   →   "
-                      "3) ▶ Run Pipeline.    Watch the Log while it runs — "
-                      "when it finishes, Compare shows both audios.",
-                 bg="#0f1d14", fg="#4ade80", font=(MONO_FONT, 9),
-                 anchor="w", justify="left",
-                 ).pack(side="left", padx=14, pady=6)
 
         # Pipeline progress panel (rows are clickable → preview output files)
         self._build_pipeline_panel(tab)
@@ -4161,53 +4314,16 @@ class EndToEndApp:
 
         self._sf_show_view("wave")
 
-        # Apply the saved Simple/Advanced layout now that all panels exist.
-        self._apply_ui_mode()
-
-    # ── Simple / Advanced mode ────────────────────────────────────────────────
-
-    def _save_ui_settings(self):
-        d = _ui_settings_load()
-        d["simple_mode"]      = bool(self._simple_mode_var.get())
-        d["auto_open_result"] = bool(self._auto_open_var.get())
-        _ui_settings_save(d)
-
-    def _toggle_ui_mode(self):
-        self._simple_mode_var.set(not self._simple_mode_var.get())
-        self._apply_ui_mode()
-
-    def _apply_ui_mode(self):
-        """Simple mode hides expert-level rows (region tuning, LLM/prompt row)
-        inside the ⚙ Settings dialog, and shows the beginner hint bar on the
-        main tab."""
-        simple = self._simple_mode_var.get()
-        try:
-            self._hint_bar.pack_forget()
-            self._regions_frame_en.pack_forget()
-            self._regions_frame_bn.pack_forget()
-            self._model_row.pack_forget()
-            if simple:
-                self._hint_bar.pack(fill="x", side="top",
-                                    after=self._sf_run_bar)
-            else:
-                # Restore original order inside the Settings dialog:
-                # EN regions, BN regions, then the translation-options panel;
-                # LLM row back at the end of that panel.
-                self._regions_frame_en.pack(fill="x", side="top",
-                                            before=self._tp_frame)
-                self._regions_frame_bn.pack(fill="x", side="top",
-                                            before=self._tp_frame)
-                self._model_row.pack(fill="x")
-            self._mode_btn.config(
-                text="⚙ Show Advanced" if simple else "🔰 Simple Mode")
-        except Exception:
-            pass
-        self._save_ui_settings()
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>", "<Button-6>", "<Button-7>"):
             self.canvas.get_tk_widget().bind(seq, self._on_waveform_scroll)
 
         self.root.bind("<space>", lambda e: self._toggle_play())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _save_ui_settings(self):
+        d = _ui_settings_load()
+        d["auto_open_result"] = bool(self._auto_open_var.get())
+        _ui_settings_save(d)
 
     def _build_toolbar(self, tb):
         self._btn(tb, "Open Audio", self._pick_file).pack(side="left", padx=(14, 6), pady=10)
@@ -5929,9 +6045,6 @@ class EndToEndApp:
         tk.Label(top, text="PIPELINE SETTINGS", bg=PANEL, fg="#a78bfa",
                  font=(MONO_FONT, 10, "bold")).pack(side="left",
                                                     padx=(14, 10), pady=10)
-        self._mode_btn = self._btn(top, "", self._toggle_ui_mode,
-                                   bg="#1e1b3a", fg="#a78bfa", abg="#312e81")
-        self._mode_btn.pack(side="left", padx=8, pady=6)
         tk.Checkbutton(
             top, text="Auto-open result", variable=self._auto_open_var,
             command=self._save_ui_settings,
@@ -5959,6 +6072,160 @@ class EndToEndApp:
             win.lift()
         except Exception:
             pass
+
+    # ── 🎭 Multi-speaker dialog ───────────────────────────────────────────────
+
+    def _open_speakers_dialog(self):
+        """Assign a different ElevenLabs voice to individual paragraphs of
+        the translated script. Saved per-project; applied on the next
+        ▶ Run Pipeline / Re-Dub."""
+        p = self._sf_run_paths()
+        if not p:
+            messagebox.showinfo("Speakers", "Open an audio file first.")
+            return
+        base = p["base"]
+        lang = self._current_language()
+        text = (self.punctuation_result or "").strip()
+        if not text:
+            fs_path = base + "_FinalScript.txt"
+            if os.path.isfile(fs_path):
+                try:
+                    with open(fs_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        text = _extract_translation_from_finalscript(
+                            f.read(), lang).strip()
+                except Exception:
+                    text = ""
+        paras = _split_translation_paragraphs(text) if text else []
+        if not paras:
+            messagebox.showinfo(
+                "Speakers",
+                "No translated script yet — run the pipeline at least up to "
+                "Translation first, then assign voices per paragraph here.")
+            return
+
+        voice_opts = list(getattr(self, "_el_voice_options", []) or [])
+        id_to_label = {o["voice_id"]: o["label"] for o in voice_opts}
+        DEFAULT_LABEL = "— default voice —"
+        values = [DEFAULT_LABEL] + [o["label"] for o in voice_opts]
+
+        saved = _speakers_load(base).get("assignments") or {}
+
+        win = tk.Toplevel(self.root)
+        win.title("Speakers — voice per paragraph")
+        win.configure(bg=BG)
+        win.geometry("980x600")
+        win.transient(self.root)
+
+        hdr = tk.Frame(win, bg=PANEL, height=48)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="🎭 SPEAKERS", bg=PANEL, fg="#a78bfa",
+                 font=(MONO_FONT, 11, "bold")).pack(side="left",
+                                                    padx=(14, 10), pady=12)
+        tk.Label(hdr,
+                 text="Pick a voice per paragraph — paragraphs left on "
+                      "“default voice” use the voice from ⚙ Settings. "
+                      "Applied on the next ▶ Run Pipeline.",
+                 bg=PANEL, fg=TEXT_FAINT, font=(MONO_FONT, 9)).pack(
+            side="left", padx=6)
+
+        status = tk.Label(win, text="", bg=BG, fg=TR_ACCENT,
+                          font=(MONO_FONT, 9), anchor="w")
+
+        wrap = tk.Frame(win, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(8, 4))
+        cv = tk.Canvas(wrap, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(cv, bg=BG)
+        cv_win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda _e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>",
+                lambda ev: cv.itemconfigure(cv_win, width=ev.width))
+
+        def _wheel(ev):
+            n = getattr(ev, "num", 0)
+            d = getattr(ev, "delta", 0)
+            cv.yview_scroll(-1 if (d > 0 or n == 4) else 1, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            cv.bind(seq, _wheel)
+            inner.bind(seq, _wheel)
+
+        row_vars: List[tk.StringVar] = []
+        for i, para in enumerate(paras):
+            row = tk.Frame(inner, bg=PANEL if i % 2 == 0 else PANEL2)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"¶{i + 1:>3}", bg=row["bg"], fg="#a78bfa",
+                     font=(MONO_FONT, 9, "bold"), width=5).pack(
+                side="left", padx=(8, 4), pady=6)
+            var = tk.StringVar(value=DEFAULT_LABEL)
+            asg = saved.get(str(i)) or {}
+            vid = _sanitize_voice_id(asg.get("voice_id", ""))
+            if vid:
+                var.set(id_to_label.get(vid, vid))
+            cb = ttk.Combobox(row, textvariable=var, values=values, width=34)
+            cb.pack(side="left", padx=(0, 10), pady=6)
+            preview = " ".join(para.split())
+            if len(preview) > 110:
+                preview = preview[:109] + "…"
+            tk.Label(row, text=preview, bg=row["bg"], fg=TEXT,
+                     font=(MONO_FONT, 9), anchor="w").pack(
+                side="left", fill="x", expand=True, padx=(0, 8))
+            row_vars.append(var)
+
+        def _save():
+            assignments = {}
+            n = 0
+            for i, var in enumerate(row_vars):
+                sel = (var.get() or "").strip()
+                if not sel or sel == DEFAULT_LABEL:
+                    continue
+                vid = self._el_label_to_id.get(sel) \
+                    or self._el_label_to_id.get(
+                        re.sub(r"\s+", " ", sel).strip()) \
+                    or _sanitize_voice_id(sel)
+                if not vid:
+                    continue
+                assignments[str(i)] = {"voice_id": vid, "label": sel}
+                n += 1
+            try:
+                _speakers_save(base, {
+                    "assignments": assignments,
+                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                })
+            except Exception as ex:
+                status.config(text=f"Could not save: {ex}", fg="#f87171")
+                return
+            status.config(
+                text=(f"Saved — {n} paragraph(s) with a custom voice. "
+                      "Run the pipeline to dub with these speakers.")
+                if n else
+                "Saved — all paragraphs use the default voice.",
+                fg=TR_ACCENT)
+            self._sf_log_append(
+                f"[Speakers] {n} paragraph voice assignment(s) saved → "
+                f"{os.path.basename(_speakers_file_path(base))}")
+
+        def _clear():
+            for var in row_vars:
+                var.set(DEFAULT_LABEL)
+
+        btns = tk.Frame(win, bg=BG)
+        btns.pack(fill="x", padx=12, pady=(2, 10))
+        status.pack(in_=btns, side="left", fill="x", expand=True)
+        self._btn(btns, "  Close  ", win.destroy,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="right", padx=(6, 0))
+        self._btn(btns, " Clear All ", _clear,
+                  bg="#1f1213", fg="#f87171", abg="#3a1414").pack(
+            side="right", padx=6)
+        self._btn(btns, " 💾 Save Speakers ", _save,
+                  bg="#0f1d14", fg=TR_ACCENT, abg="#1f4d2e").pack(
+            side="right", padx=6)
 
     def _sf_show_view(self, which):
         """Swap the main area between Waveform / Log / Compare."""
@@ -6212,10 +6479,17 @@ class EndToEndApp:
         self._btn(bar, " Fit ", self._sf_cmp_zoom_fit,
                   bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
             side="left", padx=2, pady=6)
+        self._btn(bar, " ◀ ", lambda: self._sf_cmp_scroll_step(-1),
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=(8, 2), pady=6)
+        self._btn(bar, " ▶ ", lambda: self._sf_cmp_scroll_step(1),
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=2, pady=6)
         self._sf_cmp_info = tk.Label(
             bar, text="Run the full pipeline — audio appears here. "
                       "Click = seek · double-click a chunk = play it · "
-                      "scroll = pan · ctrl+scroll = zoom",
+                      "drag a dub chunk = move it · scroll = pan · "
+                      "ctrl+scroll = zoom",
             bg=PANEL2, fg=TEXT_FAINT, font=(MONO_FONT, 9), anchor="w")
         self._sf_cmp_info.pack(side="left", fill="x", expand=True, padx=10)
         self._sf_cmp_bar = bar
@@ -6255,15 +6529,32 @@ class EndToEndApp:
         self._sf_cmp_fig, (self._sf_cmp_ax_top, self._sf_cmp_ax_bot) = \
             plt.subplots(2, 1, figsize=(12, 3.6))
         self._sf_cmp_fig.patch.set_facecolor(BG)
+
+        # Horizontal scrollbar (custom canvas thumb, like the Waveform view).
+        self._sf_cmp_sb = tk.Canvas(parent, height=14, bg="#1e293b",
+                                    highlightthickness=0, cursor="hand2")
+        self._sf_cmp_sb.pack(fill="x", side="bottom", pady=(1, 2))
+        self._sf_cmp_sb.bind("<Configure>",       self._sf_cmp_sb_redraw)
+        self._sf_cmp_sb.bind("<ButtonPress-1>",   self._sf_cmp_sb_press)
+        self._sf_cmp_sb.bind("<B1-Motion>",       self._sf_cmp_sb_drag)
+        self._sf_cmp_sb.bind("<ButtonRelease-1>", self._sf_cmp_sb_release)
+        self._sf_cmp_sb_drag_x   = None
+        self._sf_cmp_sb_drag_pos = 0.0
+
         self._sf_cmp_canvas = FigureCanvasTkAgg(self._sf_cmp_fig,
                                                 master=parent)
         w = self._sf_cmp_canvas.get_tk_widget()
         w.configure(bg=BG, cursor="hand2")
         w.pack(fill="both", expand=True)
         self._sf_cmp_canvas.mpl_connect("button_press_event",
-                                        self._sf_cmp_on_click)
+                                        self._sf_cmp_on_press)
+        self._sf_cmp_canvas.mpl_connect("motion_notify_event",
+                                        self._sf_cmp_on_motion)
+        self._sf_cmp_canvas.mpl_connect("button_release_event",
+                                        self._sf_cmp_on_release)
         self._sf_cmp_canvas.mpl_connect("scroll_event",
                                         self._sf_cmp_on_scroll)
+        self._sf_cmp_press = None      # pending click / chunk-drag state
         self._sf_cmp_data = {}
         self._sf_cmp_draw()
 
@@ -6466,6 +6757,7 @@ class EndToEndApp:
         except Exception:
             pass
         self._sf_cmp_canvas.draw()
+        self._sf_cmp_sb_redraw()
 
     # ── zoom / scroll ────────────────────────────────────────────────────────
 
@@ -6508,10 +6800,74 @@ class EndToEndApp:
         self._sf_cmp_scroll = new_x0 / (total - vis)
         self._sf_cmp_draw()
 
-    def _sf_cmp_on_click(self, event):
-        """Single click = seek that track's playhead (media-player style);
-        it also selects the chunk under the pointer (dub → regenerate row).
-        Double-click a chunk = play just that chunk."""
+    def _sf_cmp_set_scroll(self, frac):
+        self._sf_cmp_scroll = min(max(frac, 0.0), 1.0)
+        self._sf_cmp_draw()
+
+    def _sf_cmp_scroll_step(self, direction):
+        """◀ / ▶ buttons: pan by half a screen."""
+        if not self._sf_cmp_data:
+            return
+        x0, x1, total = self._sf_cmp_view_window()
+        vis = x1 - x0
+        if total <= vis:
+            return
+        new_x0 = min(max(x0 + direction * vis * 0.5, 0.0), total - vis)
+        self._sf_cmp_set_scroll(new_x0 / (total - vis))
+
+    # ── compare-view scrollbar (canvas thumb) ────────────────────────────────
+
+    def _sf_cmp_sb_geom(self):
+        w = self._sf_cmp_sb.winfo_width()
+        x0, x1, total = self._sf_cmp_view_window()
+        vis   = max(x1 - x0, 1e-6)
+        ratio = min(vis / max(total, 1e-6), 1.0)
+        thumb_w    = max(24, int(w * ratio))
+        scrollable = max(1, w - thumb_w)
+        tx0 = int(self._sf_cmp_scroll * scrollable)
+        return tx0, tx0 + thumb_w, scrollable, thumb_w
+
+    def _sf_cmp_sb_redraw(self, _event=None):
+        c = getattr(self, "_sf_cmp_sb", None)
+        if not c:
+            return
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 2:
+            return
+        c.delete("all")
+        c.create_rectangle(0, 0, w, h, fill="#1e293b", outline="")
+        tx0, tx1, _, _ = self._sf_cmp_sb_geom()
+        c.create_rectangle(tx0 + 1, 2, tx1 - 1, h - 2,
+                           fill="#475569", outline="#64748b")
+
+    def _sf_cmp_sb_press(self, event):
+        if not self._sf_cmp_data:
+            return
+        tx0, tx1, scrollable, thumb_w = self._sf_cmp_sb_geom()
+        if tx0 <= event.x <= tx1:
+            self._sf_cmp_sb_drag_x   = event.x
+            self._sf_cmp_sb_drag_pos = self._sf_cmp_scroll
+        else:
+            pos = min(max((event.x - thumb_w / 2) / scrollable, 0.0), 1.0)
+            self._sf_cmp_sb_drag_x   = event.x
+            self._sf_cmp_sb_drag_pos = pos
+            self._sf_cmp_set_scroll(pos)
+
+    def _sf_cmp_sb_drag(self, event):
+        if self._sf_cmp_sb_drag_x is None or not self._sf_cmp_data:
+            return
+        _, _, scrollable, _ = self._sf_cmp_sb_geom()
+        dx = event.x - self._sf_cmp_sb_drag_x
+        self._sf_cmp_set_scroll(self._sf_cmp_sb_drag_pos + dx / scrollable)
+
+    def _sf_cmp_sb_release(self, _event=None):
+        self._sf_cmp_sb_drag_x = None
+
+    # ── compare-view mouse: click = seek, drag dub chunk = move (Reaper) ─────
+
+    def _sf_cmp_on_press(self, event):
+        """Press: double-click plays the chunk; single press arms either a
+        click-seek (handled on release) or a chunk drag (handled on motion)."""
         if event.xdata is None:
             return
         side = ("en" if event.inaxes is self._sf_cmp_ax_top else
@@ -6524,6 +6880,7 @@ class EndToEndApp:
                         if a0 <= t <= a1), None)
 
         if getattr(event, "dblclick", False):
+            self._sf_cmp_press = None
             if hit_idx is None:
                 return
             s0, s1, stext = d["subs"][hit_idx]
@@ -6540,7 +6897,64 @@ class EndToEndApp:
                      f"{s0:.1f}–{s1:.1f}s]  {label}")
             return
 
-        # single click → seek
+        self._sf_cmp_press = {
+            "side": side, "x": t, "idx": hit_idx, "moved": False,
+            "orig": d["subs"][hit_idx] if hit_idx is not None else None,
+        }
+
+    def _sf_cmp_on_motion(self, event):
+        """Drag a dub chunk left/right (Reaper-style item move)."""
+        pr = self._sf_cmp_press
+        if (not pr or pr["side"] != "out" or pr["idx"] is None
+                or event.xdata is None):
+            return
+        d = self._sf_cmp_data.get("out")
+        if not d:
+            return
+        dx = float(event.xdata) - pr["x"]
+        x0, x1, _tot = self._sf_cmp_view_window()
+        vis = max(x1 - x0, 1e-6)
+        try:
+            px_w = max(
+                self._sf_cmp_canvas.get_tk_widget().winfo_width() - 90, 200)
+        except Exception:
+            px_w = 1000
+        if not pr["moved"] and abs(dx) * (px_w / vis) < 5:
+            return                      # ignore tiny jitter — still a click
+        pr["moved"] = True
+        s0, s1, stext = pr["orig"]
+        ns0 = max(0.0, s0 + dx)
+        d["subs"][pr["idx"]] = (ns0, ns0 + (s1 - s0), stext)
+        self._sf_cmp_sel = pr["idx"]
+        self._sf_cmp_info.config(
+            text=f"Moving chunk {pr['idx'] + 1}: {s0:.2f}s → {ns0:.2f}s "
+                 f"({'+' if ns0 >= s0 else ''}{ns0 - s0:.2f}s) — release to apply")
+        self._sf_cmp_draw()
+
+    def _sf_cmp_on_release(self, event):
+        pr = self._sf_cmp_press
+        self._sf_cmp_press = None
+        if not pr:
+            return
+        side = pr["side"]
+        d = self._sf_cmp_data.get(side)
+        if not d:
+            return
+
+        if pr["moved"]:
+            # Chunk drag finished → rebuild the synced audio at the new spot.
+            s0_old = pr["orig"][0]
+            s0_new = d["subs"][pr["idx"]][0]
+            if abs(s0_new - s0_old) < 0.005:
+                d["subs"][pr["idx"]] = pr["orig"]
+                self._sf_cmp_draw()
+                return
+            self._sf_cmp_apply_move(pr["idx"], pr["orig"], s0_new)
+            return
+
+        # Plain click → seek that track's playhead (media-player style).
+        t = pr["x"]
+        hit_idx = pr["idx"]
         was_playing = (self._sf_cmp_playing_side == side)
         self._sf_cmp_cursor[side] = min(max(t, 0.0), d["dur"])
         if hit_idx is not None:
@@ -6560,6 +6974,104 @@ class EndToEndApp:
             self._sf_cmp_play(side)      # live seek: restart from new cursor
         else:
             self._sf_cmp_draw()
+
+    def _sf_cmp_apply_move(self, idx, orig_sub, new_s0):
+        """Persist a dragged dub chunk: shift its entry in the sync
+        timestamps, rebuild the synced audio from the TTS source, and update
+        the synced SRT. Falls back to slicing the synced WAV directly when
+        the timestamps/TTS files are missing (old projects)."""
+        p = self._sf_run_paths()
+        if not p:
+            return
+        synced_path = p["synced_audio"]
+        tts_path    = p["tts_audio"]
+        ts_path     = p["base"] + "_sync_timestamps.txt"
+        srt_path    = p["base"] + "_sync_synced.srt"
+        if not synced_path or not os.path.isfile(synced_path):
+            messagebox.showerror("Move chunk", "Synced audio file not found.")
+            self._sf_cmp_load(keep_sel=idx)
+            return
+        if not PYDUB_AVAILABLE:
+            messagebox.showerror("pydub missing",
+                                 "pydub is required to move chunks.")
+            self._sf_cmp_load(keep_sel=idx)
+            return
+        old_s0, old_s1, _txt = orig_sub
+        delta_ms = int(round((new_s0 - old_s0) * 1000))
+        self._sf_cmp_info.config(
+            text=f"Applying move of chunk {idx + 1} "
+                 f"({'+' if delta_ms >= 0 else ''}{delta_ms / 1000.0:.2f}s)…")
+        self._sf_log_append(
+            f"[Compare] Moving dub chunk {idx + 1}: {old_s0:.2f}s → "
+            f"{new_s0:.2f}s ({'+' if delta_ms >= 0 else ''}{delta_ms} ms)")
+
+        def _worker():
+            try:
+                # One-time backup of the untouched synced audio.
+                bak = os.path.splitext(synced_path)[0] + "_backup.wav"
+                if not os.path.exists(bak):
+                    shutil.copy2(synced_path, bak)
+
+                entries = _parse_timestamps_text(ts_path)
+                if entries and tts_path and os.path.isfile(tts_path) \
+                        and len(entries) > idx:
+                    # Preferred path: shift the timestamp entry and rebuild
+                    # the whole synced file from the clean TTS source.
+                    by_start = sorted(entries,
+                                      key=lambda e: e["synced_start_ms"])
+                    ent = by_start[idx]
+                    ent["synced_start_ms"] = max(
+                        0, ent["synced_start_ms"] + delta_ms)
+                    with open(ts_path, "w", encoding="utf-8") as f:
+                        f.write(_format_timestamps_as_text(
+                            sorted(entries, key=lambda e: e["index"])))
+                    sync_audio_with_timestamps(tts_path, entries, synced_path)
+                else:
+                    # Fallback: splice the chunk inside the synced WAV itself.
+                    synced = _AudioSegment.from_file(synced_path)
+                    a0 = max(0, int(old_s0 * 1000))
+                    a1 = min(len(synced), int(old_s1 * 1000))
+                    seg = synced[a0:a1]
+                    gap = _AudioSegment.silent(
+                        duration=a1 - a0, frame_rate=synced.frame_rate)
+                    canvas = synced[:a0] + gap + synced[a1:]
+                    npos = max(0, a0 + delta_ms)
+                    if npos + len(seg) > len(canvas):
+                        canvas += _AudioSegment.silent(
+                            duration=npos + len(seg) - len(canvas),
+                            frame_rate=canvas.frame_rate)
+                    canvas = canvas.overlay(seg, position=npos)
+                    canvas.export(synced_path, format="wav")
+
+                # Shift the matching cue in the synced SRT.
+                try:
+                    with open(srt_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        srt_subs = _parse_srt_from_string(f.read())
+                    ordered = sorted(srt_subs.values(), key=lambda s: s.start)
+                    if idx < len(ordered):
+                        ordered[idx].shift(delta_ms)
+                        if ordered[idx].start < 0:
+                            ordered[idx].start = 0
+                        with open(srt_path, "w", encoding="utf-8") as f:
+                            f.write(_write_srt_from_dict(srt_subs))
+                except Exception:
+                    pass
+
+                self._sf_log_append(
+                    f"[Compare] ✔ chunk {idx + 1} moved → "
+                    f"{os.path.basename(synced_path)}")
+                self.root.after(0, lambda: self._sf_cmp_load(keep_sel=idx))
+            except Exception as exc:
+                err = str(exc)
+
+                def _fail(e=err):
+                    self._sf_cmp_info.config(text=f"Move error: {e}")
+                    messagebox.showerror("Move chunk", e)
+                    self._sf_cmp_load(keep_sel=idx)
+                self.root.after(0, _fail)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _sf_cmp_fill_edit(self, idx):
         """Put chunk idx's dubbed text into the edit row and show the row."""
@@ -8354,22 +8866,45 @@ class EndToEndApp:
                 def _cb(msg):
                     _st(f"Re-dub {rev:02d}: {msg}", "#d97706")
 
-                _st(f"Re-dub {rev:02d}: emotion pass…", "#d97706")
-                enriched = (_run_emotion_enrichment(
-                                new_text, language=language,
-                                model=GEMINI_DEFAULT_MODEL, status_cb=_cb)
-                            if emotion_on else new_text)
                 name_src = audio_path or base + ".wav"
                 tts_path = os.path.join(outdir, _tts_output_name(
                     language, name_src, f"_tts_redub{rev:02d}"))
+
+                # Multi-speaker: honour the project's saved 🎭 voice map.
+                spk_paras = _split_translation_paragraphs(new_text)
+                spk_map = (_speakers_voice_map(base)
+                           if tts_platform == "ElevenLabs" else {})
+                spk_map = {i: v for i, v in spk_map.items()
+                           if 0 <= i < len(spk_paras)}
+
                 _st(f"Re-dub {rev:02d}: synthesizing speech…", "#d97706")
-                if tts_platform == "ElevenLabs":
+                if tts_platform == "ElevenLabs" and spk_map:
+                    enrich_cb = ((lambda txt: _run_emotion_enrichment(
+                                     txt, language=language,
+                                     model=GEMINI_DEFAULT_MODEL,
+                                     status_cb=_cb))
+                                 if emotion_on else None)
+                    synthesize_tts_elevenlabs_multi(
+                        spk_paras, spk_map, tts_path, api_key=api_key,
+                        default_voice_id=el_voice_id, model_id=el_model,
+                        status_cb=_cb, enrich_cb=enrich_cb)
+                elif tts_platform == "ElevenLabs":
+                    _st(f"Re-dub {rev:02d}: emotion pass…", "#d97706")
+                    enriched = (_run_emotion_enrichment(
+                                    new_text, language=language,
+                                    model=GEMINI_DEFAULT_MODEL, status_cb=_cb)
+                                if emotion_on else new_text)
                     synthesize_tts_elevenlabs(enriched, tts_path,
                                               api_key=api_key,
                                               voice_id=el_voice_id,
                                               model_id=el_model,
                                               status_cb=_cb)
                 else:
+                    _st(f"Re-dub {rev:02d}: emotion pass…", "#d97706")
+                    enriched = (_run_emotion_enrichment(
+                                    new_text, language=language,
+                                    model=GEMINI_DEFAULT_MODEL, status_cb=_cb)
+                                if emotion_on else new_text)
                     synthesize_tts(_strip_emotion_tags(enriched), tts_path,
                                    status_cb=_cb, lang_code=tts_lang_code,
                                    voice_name=tts_voice_name)
@@ -10103,24 +10638,49 @@ class EndToEndApp:
                 def _tts_status_cb(msg):
                     self.root.after(0, lambda m=msg: self._set_stage("S2", m, "#d97706"))
 
-                # Emotion enrichment — skipped when checkbox is unchecked
-                enriched_text = (
-                    _run_emotion_enrichment(
-                        punc_result, language=pipeline_language,
-                        model=GEMINI_DEFAULT_MODEL, status_cb=_tts_status_cb)
-                    if self._emotion_enabled_var.get() else punc_result
-                )
+                # Multi-speaker: a saved per-paragraph voice map switches the
+                # ElevenLabs synthesis to speaker groups. Emotion enrichment
+                # then runs per group so paragraph indices stay aligned with
+                # the 🎭 Speakers dialog.
+                spk_paras = _split_translation_paragraphs(punc_result)
+                spk_map = (_speakers_voice_map(base)
+                           if tts_platform == "ElevenLabs" else {})
+                spk_map = {i: v for i, v in spk_map.items()
+                           if 0 <= i < len(spk_paras)}
 
                 self.root.after(0, lambda: self._set_stage("S2", "Synthesizing…", "#d97706"))
-                if tts_platform == "ElevenLabs":
-                    synthesize_tts_elevenlabs(enriched_text, tts_path, api_key=api_key,
-                                              voice_id=el_voice_id, model_id=el_model,
-                                              status_cb=_tts_status_cb)
+                if tts_platform == "ElevenLabs" and spk_map:
+                    self._sf_log_append(
+                        f"[S2] 🎭 Multi-speaker dub: {len(spk_map)} "
+                        f"paragraph(s) use a custom voice "
+                        f"(of {len(spk_paras)} total).")
+                    enrich_cb = (
+                        (lambda txt: _run_emotion_enrichment(
+                            txt, language=pipeline_language,
+                            model=GEMINI_DEFAULT_MODEL,
+                            status_cb=_tts_status_cb))
+                        if self._emotion_enabled_var.get() else None)
+                    synthesize_tts_elevenlabs_multi(
+                        spk_paras, spk_map, tts_path, api_key=api_key,
+                        default_voice_id=el_voice_id, model_id=el_model,
+                        status_cb=_tts_status_cb, enrich_cb=enrich_cb)
                 else:
-                    # Strip ElevenLabs-specific tags before sending to Google TTS
-                    synthesize_tts(_strip_emotion_tags(enriched_text), tts_path,
-                                   status_cb=_tts_status_cb,
-                                   lang_code=tts_lang_code, voice_name=tts_voice_name)
+                    # Emotion enrichment — skipped when checkbox is unchecked
+                    enriched_text = (
+                        _run_emotion_enrichment(
+                            punc_result, language=pipeline_language,
+                            model=GEMINI_DEFAULT_MODEL, status_cb=_tts_status_cb)
+                        if self._emotion_enabled_var.get() else punc_result
+                    )
+                    if tts_platform == "ElevenLabs":
+                        synthesize_tts_elevenlabs(enriched_text, tts_path, api_key=api_key,
+                                                  voice_id=el_voice_id, model_id=el_model,
+                                                  status_cb=_tts_status_cb)
+                    else:
+                        # Strip ElevenLabs-specific tags before sending to Google TTS
+                        synthesize_tts(_strip_emotion_tags(enriched_text), tts_path,
+                                       status_cb=_tts_status_cb,
+                                       lang_code=tts_lang_code, voice_name=tts_voice_name)
                 self.root.after(0, lambda: self._set_stage("S2", "✔ Done", "#22c55e"))
 
                 # ── Early exit: TTS Audio only ───────────────────────────────
@@ -10184,24 +10744,25 @@ class EndToEndApp:
                 synced_subs, orig_te_subs, _sync_log = run_sync_from_strings(
                     en_srt, te_srt, mapping_text,
                     en_audio_duration=_en_audio_dur)
-                # Surface sync-quality info: force-fitted sections failed the
-                # normal fit rules and were anchored to their English start
-                # (possibly slightly pushed); dropped-from-mapping subs were
-                # kept at original timing. Both used to cause "unsynced" dubs.
-                _n_fit  = _sync_log.count("[force-fit]")
+                # Surface sync-quality info: bleed-over sections were longer
+                # than their English slot and anchored to their English start
+                # (the order sweep keeps them from overlapping); dropped-
+                # from-mapping subs were kept at original timing.
+                _n_fit  = _sync_log.count("[bleed-over]")
                 _n_kept = 1 if "missing from the" in _sync_log else 0
                 if _n_fit or _n_kept:
                     self.root.after(0, lambda a=_n_fit:
                         self._set_stage(
                             "S3d",
-                            f"✔ synced — {a} section(s) force-fit to the "
-                            f"English timeline (see sync log)",
+                            f"✔ synced — {a} long section(s) anchored to "
+                            f"their English start (see sync log)",
                             "#f59e0b"))
                     self._sf_log_append(
-                        f"[S3d] ⚠ {_n_fit} section(s) did not fit their slot "
-                        "and were anchored directly to their English start "
-                        "time. If a passage sounds crowded, shorten its "
-                        "translation and Re-Dub. Details: S3d sync log.")
+                        f"[S3d] ⚠ {_n_fit} section(s) were longer than their "
+                        "English slot — they start on time and bleed into "
+                        "the following gap at natural pace. If a passage "
+                        "sounds crowded, shorten its translation and Re-Dub, "
+                        "or drag chunks in Compare to taste.")
                 else:
                     self.root.after(0, lambda n=len(synced_subs):
                         self._set_stage("S3d", f"✔ {n} subtitles synced",
@@ -10997,6 +11558,19 @@ class EndToEndApp:
             self._tts_language_var.set(lang)
             self._on_tts_language_change()
 
+        # Point every path helper at the project's saved run location BEFORE
+        # anything derives paths from the loaded audio file. Without this,
+        # reopening a project whose audio lives inside its own output folder
+        # made _sf_run_paths()/_prepare_output_dir() nest a new folder inside
+        # the old one on every reopen — and Compare/stage previews looked
+        # for outputs in the wrong (empty) folder.
+        if e.get("base"):
+            self._last_run_base = e["base"]
+        if e.get("outdir"):
+            self._last_run_outdir = e["outdir"]
+        if lang:
+            self._last_run_language = lang
+
         # Load the project's audio into the Single File tab (prefer the copy
         # inside the project folder — it always travels with the project).
         audio = ""
@@ -11014,6 +11588,60 @@ class EndToEndApp:
         self._scripts_load_project()
         self._refresh_stage_bar()
         self.notebook.select(self.main_tab)
+
+        # Restore pipeline-stage ticks from the files already on disk, and
+        # reopen the Compare view when a synced dub exists — so an old
+        # project looks exactly like it did right after its last run.
+        self._sf_restore_stage_status(e)
+
+    _STAGE_RESTORE_FILES = {
+        "S1a": ("{base}.srt",),
+        "S1b": ("{base}_FinalScript.txt",),
+        "S2":  ("{tts_audio}",),
+        "S3a": ("{base}_sync_en.srt",),
+        "S3b": ("{base}_sync_te.srt",),
+        "S3c": ("{base}_sync_mapping.txt",),
+        "S3d": ("{base}_sync_synced.srt",),
+        "S3e": ("{synced_audio}",),
+    }
+
+    def _sf_restore_stage_status(self, e: dict):
+        """Mark pipeline stages Done based on output files found on disk."""
+        base = e.get("base", "")
+        if not base:
+            return
+        lang  = e.get("language", "") or self._current_language()
+        audio = e.get("audio_path", "") or (base + ".wav")
+        outdir = e.get("outdir", "") or os.path.dirname(base)
+        try:
+            tts_audio    = os.path.join(outdir, _tts_output_name(lang, audio, "_tts"))
+            synced_audio = os.path.join(outdir, _tts_output_name(lang, audio, "_synced"))
+        except Exception:
+            tts_audio = synced_audio = ""
+        n_done = 0
+        for tag, patterns in self._STAGE_RESTORE_FILES.items():
+            found = False
+            for pat in patterns:
+                p = pat.format(base=base, tts_audio=tts_audio,
+                               synced_audio=synced_audio)
+                if p and os.path.isfile(p):
+                    found = True
+                    break
+            if found:
+                self._set_stage(tag, "✔ Done (restored)", "#22c55e")
+                n_done += 1
+        if n_done:
+            self.tr_status.config(text="Project restored ✓", fg=TR_ACCENT)
+        # Synced dub on disk → open the Compare view with both waveforms,
+        # once the audio file itself has finished loading in its thread.
+        if synced_audio and os.path.isfile(synced_audio):
+            def _open_compare(tries=40):
+                if self.audio_data is None and tries > 0:
+                    self.root.after(250, lambda: _open_compare(tries - 1))
+                    return
+                self._sf_show_view("compare")
+                self._sf_cmp_load()
+            self.root.after(400, _open_compare)
 
     # ── Scripts tab (② Transcript / ③ Translation) ───────────────────────────
 
