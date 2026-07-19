@@ -148,7 +148,7 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── App version + update source ─────────────────────────────────────────────
-APP_VERSION  = "1.5.0"
+APP_VERSION  = "1.6.0"
 GITHUB_REPO  = "darpantimsina72/bulk-video-processing"   # owner/repo on GitHub
 
 # ─── Cross-platform setup ────────────────────────────────────────────────────
@@ -3441,20 +3441,62 @@ def _process_overflow(mappings, en_subs, te, processed, log_lines=None,
         if mg.no in processed: continue
         valid = [i for i in mg.en if i in en_subs]
         if valid: en_starts[mg.no] = min(en_subs[i].start for i in valid)
-    unproc = sorted(
+
+    # Sections WITH a valid English anchor are force-fitted onto the English
+    # timeline (at their English start, pushed forward just enough to not
+    # start on top of already-placed audio). The old behaviour — shoving
+    # them past the END of the English audio — made the dub sound completely
+    # out of sync whenever a few sections failed the fit rules.
+    anchored = sorted(
         [mg for mg in mappings if mg.no not in processed and mg.no in en_starts],
         key=lambda mg: en_starts[mg.no])
+    # Sections with NO usable English reference still go after the end.
+    orphans = [mg for mg in mappings
+               if mg.no not in processed and mg.no not in en_starts]
 
-    if log_lines is not None and unproc:
-        log_lines.append(
-            f"  Overflow offset: {total_dur/1000.0:.2f}s "
-            f"({total_dur:.0f} ms) [{offset_label}]")
+    placed_idx = {i for m2 in mappings if m2.no in processed
+                  for i in _te_valid(m2, te)}
 
-    placed_ends = []
-    for mg in unproc:
-        ds = total_dur + en_starts[mg.no]
-        if placed_ends and ds < placed_ends[-1]: ds = placed_ends[-1]
+    for mg in anchored:
         te_v = _te_valid(mg, te)
+        if not te_v:
+            processed.add(mg.no)
+            continue
+        want    = en_starts[mg.no]
+        sec_len = _te_len(mg, te)
+        # First-fit: earliest overlap-free position at/after the English
+        # start, walking past already-placed audio blocks.
+        ds = want
+        for a, b in sorted((te[i].start, te[i].end) for i in placed_idx):
+            if b <= ds:
+                continue
+            if a >= ds + sec_len + MIN_SPRING:
+                break
+            ds = b + MIN_SPRING
+        te_before = {i: te[i].start for i in te_v} if log_lines is not None else {}
+        _align_start(mg, te, ds)
+        placed_idx.update(te_v)
+        processed.add(mg.no)
+        if log_lines is not None:
+            te_info = "  ".join(
+                f"TE{i}:{te_before[i]:.2f}s→{te[i].start:.2f}s" for i in te_v)
+            pushed = "" if ds == want else f" (pushed +{(ds-want)/1000.0:.2f}s)"
+            log_lines.append(
+                f"  Sec {mg.no:>3} [{mg.mtype:<5}]  force-fit at EN start "
+                f"{want/1000.0:.2f}s{pushed}  {te_info}  [force-fit]")
+
+    if orphans and log_lines is not None:
+        log_lines.append(
+            f"  Overflow offset for {len(orphans)} EN-less section(s): "
+            f"{total_dur/1000.0:.2f}s ({total_dur:.0f} ms) [{offset_label}]")
+    placed_ends = []
+    for mg in orphans:
+        te_v = _te_valid(mg, te)
+        if not te_v:
+            processed.add(mg.no)
+            continue
+        ds = total_dur
+        if placed_ends and ds < placed_ends[-1]: ds = placed_ends[-1]
         te_before = {i: te[i].start for i in te_v} if log_lines is not None else {}
         _align_start(mg, te, ds)
         placed_ends.append(_te_end(mg, te))
@@ -3464,7 +3506,7 @@ def _process_overflow(mappings, en_subs, te, processed, log_lines=None,
                 f"TE{i}:{te_before[i]:.2f}s→{te[i].start:.2f}s" for i in te_v)
             log_lines.append(
                 f"  Sec {mg.no:>3} [{mg.mtype:<5}]  overflow at {ds:.2f}s  {te_info}  [overflow]")
-    return len(unproc)
+    return len(anchored) + len(orphans)
 
 
 def run_sync_from_strings(en_srt_text, te_srt_text, mapping_text,
@@ -3517,6 +3559,17 @@ def run_sync_from_strings(en_srt_text, te_srt_text, mapping_text,
     log_lines.append(f"\n=== Complete: {len(processed)}/{len(mappings)} sections synced ===")
     all_te_idx = {i for mg in mappings for i in mg.te}
     synced = {i: te[i] for i in sorted(all_te_idx) if i in te}
+    # Safety net: dubbed subtitles the LLM mapping never mentioned used to be
+    # DROPPED from the output entirely (missing audio in the dub). Keep them
+    # at their original TTS timing instead so no speech disappears.
+    missing = [i for i in sorted(te) if i not in all_te_idx]
+    if missing:
+        for i in missing:
+            synced[i] = te[i]
+        log_lines.append(
+            f"⚠ {len(missing)} dubbed subtitle(s) were missing from the "
+            f"mapping ({missing[:10]}{'…' if len(missing) > 10 else ''}) — "
+            "kept at their original timing instead of being dropped.")
     return synced, orig_te, "\n".join(log_lines)
 
 
@@ -4063,6 +4116,8 @@ class EndToEndApp:
 
         self.fig, self.ax = plt.subplots(figsize=(12, 3))
         self.fig.patch.set_facecolor(BG)
+        # Fixed margins once — tight_layout() per frame is far too slow.
+        self.fig.subplots_adjust(left=0.05, right=0.995, top=0.88, bottom=0.22)
         self._style_axes()
         self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -4078,7 +4133,7 @@ class EndToEndApp:
         self.sb_canvas.bind("<ButtonPress-1>",   self._sb_on_press)
         self.sb_canvas.bind("<B1-Motion>",       self._sb_on_drag)
         self.sb_canvas.bind("<ButtonRelease-1>", self._sb_on_release)
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>", "<Button-6>", "<Button-7>"):
             self.sb_canvas.bind(seq, self._on_waveform_scroll)
 
         self.canvas.mpl_connect("button_press_event",  self._on_canvas_click)
@@ -4148,7 +4203,7 @@ class EndToEndApp:
         except Exception:
             pass
         self._save_ui_settings()
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>", "<Button-6>", "<Button-7>"):
             self.canvas.get_tk_widget().bind(seq, self._on_waveform_scroll)
 
         self.root.bind("<space>", lambda e: self._toggle_play())
@@ -6146,11 +6201,56 @@ class EndToEndApp:
         self._btn(bar, " ⟳ Reload ", self._sf_cmp_load,
                   bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
             side="left", padx=(10, 4), pady=6)
+        tk.Frame(bar, bg=PANEL_BORDER, width=2, height=24).pack(
+            side="left", padx=(8, 8), pady=8)
+        self._btn(bar, " − ", lambda: self._sf_cmp_zoom_by(0.67),
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=2, pady=6)
+        self._btn(bar, " + ", lambda: self._sf_cmp_zoom_by(1.5),
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=2, pady=6)
+        self._btn(bar, " Fit ", self._sf_cmp_zoom_fit,
+                  bg=BTN_BG, fg=BTN_FG, abg=BTN_ACT).pack(
+            side="left", padx=2, pady=6)
         self._sf_cmp_info = tk.Label(
-            bar, text="Run the full pipeline — English + synced audio "
-                      "appear here. Click a chunk to hear it.",
+            bar, text="Run the full pipeline — audio appears here. "
+                      "Click = seek · double-click a chunk = play it · "
+                      "scroll = pan · ctrl+scroll = zoom",
             bg=PANEL2, fg=TEXT_FAINT, font=(MONO_FONT, 9), anchor="w")
         self._sf_cmp_info.pack(side="left", fill="x", expand=True, padx=10)
+        self._sf_cmp_bar = bar
+
+        # media-player state: per-track cursor + zoom/scroll window
+        self._sf_cmp_cursor       = {"en": 0.0, "out": 0.0}
+        self._sf_cmp_zoom         = 1.0
+        self._sf_cmp_scroll       = 0.0
+        self._sf_cmp_playing_side = None
+        self._sf_cmp_play_from    = 0.0
+        self._sf_cmp_play_t0      = 0.0
+
+        # Chunk-regenerate row — appears when a dubbed chunk is selected.
+        # Edit the dubbed text, then ⟳ regenerates ONLY that chunk and
+        # splices it back into the synced audio (timeline preserved).
+        edit_row = tk.Frame(parent, bg=PANEL3, bd=0,
+                            highlightbackground=PANEL_BORDER,
+                            highlightthickness=1)
+        self._sf_cmp_edit_row = edit_row      # packed on demand
+        tk.Label(edit_row, text="Dub chunk:", bg=PANEL3, fg="#f59e0b",
+                 font=(MONO_FONT, 9, "bold")).pack(side="left",
+                                                   padx=(10, 6), pady=6)
+        self._sf_cmp_edit = tk.Text(
+            edit_row, height=2, wrap="word", bg=INPUT_BG, fg=INPUT_FG,
+            insertbackground=INPUT_FG, font=(MONO_FONT, 10),
+            relief="flat", bd=0)
+        self._sf_cmp_edit.pack(side="left", fill="x", expand=True, pady=4)
+        self._sf_cmp_regen_btn = self._btn(
+            edit_row, " ⟳ Regenerate Chunk ", self._sf_cmp_regen_chunk,
+            bg="#2a1a0a", fg="#f59e0b", abg="#4d2f10")
+        self._sf_cmp_regen_btn.pack(side="right", padx=(4, 8), pady=4)
+        self._btn(edit_row, " ▶ Chunk ", self._sf_cmp_play_sel,
+                  bg="#0f1d14", fg="#22c55e", abg="#1f4d2e").pack(
+            side="right", padx=4, pady=4)
+        self._sf_cmp_sel = None               # selected dub-chunk index
 
         self._sf_cmp_fig, (self._sf_cmp_ax_top, self._sf_cmp_ax_bot) = \
             plt.subplots(2, 1, figsize=(12, 3.6))
@@ -6162,11 +6262,14 @@ class EndToEndApp:
         w.pack(fill="both", expand=True)
         self._sf_cmp_canvas.mpl_connect("button_press_event",
                                         self._sf_cmp_on_click)
+        self._sf_cmp_canvas.mpl_connect("scroll_event",
+                                        self._sf_cmp_on_scroll)
         self._sf_cmp_data = {}
         self._sf_cmp_draw()
 
-    def _sf_cmp_load(self):
-        """Load English + synced audio and their SRTs in a worker thread."""
+    def _sf_cmp_load(self, keep_sel=None):
+        """Load English + synced audio and their SRTs in a worker thread.
+        keep_sel: dub-chunk index to keep selected after the reload."""
         p = self._sf_run_paths()
         if not p or not self.filepath:
             self._sf_cmp_info.config(text="Open an audio file first.")
@@ -6228,6 +6331,13 @@ class EndToEndApp:
 
             def _done():
                 self._sf_cmp_data = data
+                out_subs = data.get("out", {}).get("subs", [])
+                if keep_sel is not None and keep_sel < len(out_subs):
+                    self._sf_cmp_sel = keep_sel
+                    self._sf_cmp_fill_edit(keep_sel)
+                else:
+                    self._sf_cmp_sel = None
+                    self._sf_cmp_edit_row.pack_forget()
                 if not data:
                     self._sf_cmp_info.config(
                         text="No audio found yet — run the full pipeline first.")
@@ -6245,13 +6355,33 @@ class EndToEndApp:
             self.root.after(0, _done)
         threading.Thread(target=_load, daemon=True).start()
 
+    def _sf_cmp_view_window(self):
+        """Visible time window (x0, x1, total) from zoom + scroll state."""
+        total = max([d["dur"] for d in self._sf_cmp_data.values()] or [1.0])
+        zoom  = max(1.0, self._sf_cmp_zoom)
+        vis   = total / zoom
+        x0    = self._sf_cmp_scroll * max(0.0, total - vis)
+        return x0, x0 + vis, total
+
+    @staticmethod
+    def _sf_cmp_fmt(t):
+        m, s = divmod(max(t, 0.0), 60)
+        return f"{int(m)}:{s:04.1f}"
+
     def _sf_cmp_draw(self):
         fam = _indic_matplotlib_font()
+        x0, x1, total = self._sf_cmp_view_window()
+        vis = max(x1 - x0, 1e-6)
+        try:
+            px_w = max(
+                self._sf_cmp_canvas.get_tk_widget().winfo_width() - 90, 200)
+        except Exception:
+            px_w = 1000
+        px_per_s = px_w / vis
         specs = (
             (self._sf_cmp_ax_top, "en",  "#3b82f6", "English (original)"),
             (self._sf_cmp_ax_bot, "out", TR_ACCENT, "Synced dub"),
         )
-        xmax = max([d["dur"] for d in self._sf_cmp_data.values()] or [1.0])
         for ax, side, color, name in specs:
             ax.clear()
             ax.set_facecolor("#0f172a")
@@ -6266,32 +6396,64 @@ class EndToEndApp:
                 ax.set_xticks([])
                 ax.set_yticks([])
                 continue
-            t = np.linspace(0, d["dur"], len(d["env"]))
-            ax.fill_between(t, -d["env"], d["env"], color=color,
-                            alpha=0.75, linewidth=0, zorder=2)
+
+            # envelope — draw only the visible slice
+            env, dur = d["env"], d["dur"]
+            n = len(env)
+            if dur > 0 and n > 1:
+                i0 = max(0, int(x0 / dur * n))
+                i1 = min(n, int(min(x1, dur) / dur * n) + 1)
+                if i1 > i0:
+                    t = np.linspace(i0 / n * dur, i1 / n * dur, i1 - i0)
+                    ax.fill_between(t, -env[i0:i1], env[i0:i1], color=color,
+                                    alpha=0.75, linewidth=0, zorder=2)
+
+            # subtitle chunks — visible only; label only when it fits.
+            # Rows staggered (odd/even) so neighbouring labels don't collide.
             for k, (s0, s1, stext) in enumerate(d["subs"]):
+                if s1 < x0 or s0 > x1:
+                    continue
+                sel = (side == "out" and self._sf_cmp_sel == k)
                 ax.axvspan(s0, s1,
-                           color="#facc15" if k % 2 else "#a78bfa",
-                           alpha=0.10, zorder=1)
-                ax.axvline(s0, color="#64748b", linewidth=0.5,
-                           alpha=0.6, zorder=3)
+                           color="#f59e0b" if sel else
+                           ("#facc15" if k % 2 else "#a78bfa"),
+                           alpha=0.30 if sel else 0.10, zorder=1)
+                ax.axvline(s0, color="#f59e0b" if sel else "#64748b",
+                           linewidth=1.2 if sel else 0.5,
+                           alpha=0.9 if sel else 0.6, zorder=3)
+                chunk_px = (s1 - s0) * px_per_s
+                if not sel and chunk_px < 30:
+                    continue          # too narrow — no readable label
+                max_chars = max(int(chunk_px / 7.5), 4)
                 label = " ".join(stext.split())
-                if len(label) > 48:
-                    label = label[:48] + "…"
-                kw = {"fontsize": 6.5, "ha": "center", "va": "top",
-                      "color": "#e2e8f0", "clip_on": True, "zorder": 4,
+                if len(label) > max_chars:
+                    label = label[:max(max_chars - 1, 1)] + "…"
+                cx = min(max((s0 + s1) / 2.0, x0), x1)
+                kw = {"fontsize": 7, "ha": "center", "va": "top",
+                      "color": "#f8fafc" if sel else "#cbd5e1",
+                      "clip_on": True, "zorder": 4,
                       "transform": ax.get_xaxis_transform()}
                 if fam:
                     kw["fontfamily"] = fam
-                ax.text((s0 + s1) / 2.0, 0.98, label, **kw)
+                ax.text(cx, 0.99 if k % 2 == 0 else 0.84, label, **kw)
+
+            # playhead cursor
+            cur = self._sf_cmp_cursor.get(side, 0.0)
+            if x0 <= cur <= x1:
+                ax.axvline(cur, color=CURSOR_C, linewidth=1.5,
+                           alpha=0.95, zorder=6)
+
             ax.set_ylim(-1.05, 1.05)
-            ax.set_xlim(0, xmax)
+            ax.set_xlim(x0, x1)
             ax.set_yticks([])
             ax.grid(True, axis="x", color=GRID, linewidth=0.4,
                     linestyle="--", alpha=0.5)
-            ax.set_title(f"{name} · {d['title']} · {d['dur']:.1f}s",
-                         color=color, fontsize=8, pad=3,
-                         fontfamily="monospace", loc="left")
+            playing = "▶ " if self._sf_cmp_playing_side == side else ""
+            ax.set_title(
+                f"{playing}{name} · {d['title']} · "
+                f"{self._sf_cmp_fmt(cur)} / {self._sf_cmp_fmt(dur)}",
+                color=color, fontsize=8, pad=3,
+                fontfamily="monospace", loc="left")
 
         def fmt_time(x, _):
             m, s2 = divmod(x, 60)
@@ -6305,8 +6467,51 @@ class EndToEndApp:
             pass
         self._sf_cmp_canvas.draw()
 
+    # ── zoom / scroll ────────────────────────────────────────────────────────
+
+    def _sf_cmp_zoom_by(self, factor, center_frac=0.5):
+        if not self._sf_cmp_data:
+            return
+        x0, x1, total = self._sf_cmp_view_window()
+        cx = x0 + (x1 - x0) * center_frac
+        self._sf_cmp_zoom = min(max(self._sf_cmp_zoom * factor, 1.0), 200.0)
+        vis = total / self._sf_cmp_zoom
+        if total > vis:
+            new_x0 = min(max(cx - vis * center_frac, 0.0), total - vis)
+            self._sf_cmp_scroll = new_x0 / (total - vis)
+        else:
+            self._sf_cmp_scroll = 0.0
+        self._sf_cmp_draw()
+
+    def _sf_cmp_zoom_fit(self):
+        self._sf_cmp_zoom = 1.0
+        self._sf_cmp_scroll = 0.0
+        if self._sf_cmp_data:
+            self._sf_cmp_draw()
+
+    def _sf_cmp_on_scroll(self, event):
+        """Scroll = pan; ctrl+scroll = zoom around the pointer."""
+        if not self._sf_cmp_data:
+            return
+        x0, x1, total = self._sf_cmp_view_window()
+        if event.key == "control":
+            frac = 0.5
+            if event.xdata is not None and x1 > x0:
+                frac = min(max((event.xdata - x0) / (x1 - x0), 0.0), 1.0)
+            self._sf_cmp_zoom_by(1.25 if event.button == "up" else 0.8, frac)
+            return
+        vis = x1 - x0
+        if total <= vis:
+            return
+        step = vis * 0.15 * (-1 if event.button == "up" else 1)
+        new_x0 = min(max(x0 + step, 0.0), total - vis)
+        self._sf_cmp_scroll = new_x0 / (total - vis)
+        self._sf_cmp_draw()
+
     def _sf_cmp_on_click(self, event):
-        """Click a subtitle chunk → play just that chunk + show its text."""
+        """Single click = seek that track's playhead (media-player style);
+        it also selects the chunk under the pointer (dub → regenerate row).
+        Double-click a chunk = play just that chunk."""
         if event.xdata is None:
             return
         side = ("en" if event.inaxes is self._sf_cmp_ax_top else
@@ -6315,42 +6520,261 @@ class EndToEndApp:
         if not d:
             return
         t = float(event.xdata)
-        hit = next(((s0, s1, tx) for (s0, s1, tx) in d["subs"]
-                    if s0 <= t <= s1), None)
-        if hit is None:
+        hit_idx = next((k for k, (a0, a1, _t) in enumerate(d["subs"])
+                        if a0 <= t <= a1), None)
+
+        if getattr(event, "dblclick", False):
+            if hit_idx is None:
+                return
+            s0, s1, stext = d["subs"][hit_idx]
+            try:
+                sd.stop()
+                self._sf_cmp_playing_side = None
+                sd.play(d["y"][int(s0 * d["sr"]):int(s1 * d["sr"])],
+                        samplerate=d["sr"])
+            except Exception:
+                pass
+            label = " ".join(stext.split())
+            self._sf_cmp_info.config(
+                text=f"[{'EN' if side == 'en' else 'DUB'} chunk "
+                     f"{s0:.1f}–{s1:.1f}s]  {label}")
             return
-        s0, s1, stext = hit
+
+        # single click → seek
+        was_playing = (self._sf_cmp_playing_side == side)
+        self._sf_cmp_cursor[side] = min(max(t, 0.0), d["dur"])
+        if hit_idx is not None:
+            s0, s1, stext = d["subs"][hit_idx]
+            label = " ".join(stext.split())
+            self._sf_cmp_info.config(
+                text=f"[{'EN' if side == 'en' else 'DUB'} "
+                     f"{s0:.1f}–{s1:.1f}s]  {label}")
+            if side == "out":
+                self._sf_cmp_sel = hit_idx
+                self._sf_cmp_fill_edit(hit_idx)
+        else:
+            self._sf_cmp_info.config(
+                text=f"{'English' if side == 'en' else 'Dub'} "
+                     f"cursor → {self._sf_cmp_fmt(t)}")
+        if was_playing:
+            self._sf_cmp_play(side)      # live seek: restart from new cursor
+        else:
+            self._sf_cmp_draw()
+
+    def _sf_cmp_fill_edit(self, idx):
+        """Put chunk idx's dubbed text into the edit row and show the row."""
+        d = self._sf_cmp_data.get("out")
+        if not d or idx >= len(d["subs"]):
+            return
+        self._sf_cmp_edit.delete("1.0", "end")
+        self._sf_cmp_edit.insert("1.0", d["subs"][idx][2])
+        if not self._sf_cmp_edit_row.winfo_ismapped():
+            self._sf_cmp_edit_row.pack(fill="x", after=self._sf_cmp_bar)
+
+    def _sf_cmp_play_sel(self):
+        i = self._sf_cmp_sel
+        d = self._sf_cmp_data.get("out")
+        if i is None or not d or i >= len(d["subs"]):
+            return
+        s0, s1, _tx = d["subs"][i]
         sr = d["sr"]
-        chunk = d["y"][int(s0 * sr):int(s1 * sr)]
         try:
             sd.stop()
-            sd.play(chunk, samplerate=sr)
+            sd.play(d["y"][int(s0 * sr):int(s1 * sr)], samplerate=sr)
         except Exception:
             pass
-        label = " ".join(stext.split())
-        self._sf_cmp_info.config(
-            text=f"[{'EN' if side == 'en' else 'DUB'} "
-                 f"{s0:.1f}–{s1:.1f}s]  {label}")
+
+    def _sf_cmp_regen_chunk(self):
+        """Re-synthesize ONLY the selected dubbed chunk and splice it back
+        into the synced audio. The chunk's window (its start → next chunk's
+        start) is replaced; everything else keeps its exact timing."""
+        i = self._sf_cmp_sel
+        d = self._sf_cmp_data.get("out")
+        if i is None or not d or i >= len(d["subs"]):
+            messagebox.showinfo(
+                "No chunk", "Click a chunk on the synced dub waveform first.")
+            return
+        if not PYDUB_AVAILABLE:
+            messagebox.showerror(
+                "pydub missing", "pydub is required for chunk regeneration.")
+            return
+        new_text = self._sf_cmp_edit.get("1.0", "end").strip()
+        if not new_text:
+            messagebox.showwarning(
+                "Empty text", "Chunk text is empty — type the corrected "
+                              "sentence first.")
+            return
+        p = self._sf_run_paths()
+        synced_path = p["synced_audio"] if p else ""
+        if not synced_path or not os.path.isfile(synced_path):
+            messagebox.showerror(
+                "Not found",
+                "Synced audio file not found — run the full pipeline first.")
+            return
+        try:
+            api_key = _get_api_key()
+            (tts_platform, tts_lang_code, tts_voice_name, el_voice_id,
+             _lang, el_model) = self._get_tts_params()
+        except Exception as e:
+            messagebox.showerror("TTS Settings", str(e))
+            return
+        params = {"platform": tts_platform, "api_key": api_key,
+                  "voice_id": el_voice_id, "model_id": el_model,
+                  "lang_code": tts_lang_code, "voice_name": tts_voice_name}
+
+        subs = list(d["subs"])
+        s0, s1, _old = subs[i]
+        w0_ms = int(s0 * 1000)
+        w1_ms = (int(subs[i + 1][0] * 1000) if i + 1 < len(subs)
+                 else int(d["dur"] * 1000))
+        srt_path = p["base"] + "_sync_synced.srt"
+
+        self._sf_cmp_regen_btn.config(state="disabled")
+        self._sf_cmp_info.config(text=f"Regenerating chunk {i + 1}…")
+        self._sf_log_append(
+            f"[Compare] Regenerating dub chunk {i + 1} ({s0:.1f}–{s1:.1f}s)…")
+
+        def _worker():
+            try:
+                prev_text = " ".join(t for _, _, t in subs[max(0, i - 2):i])
+                next_text = " ".join(t for _, _, t in subs[i + 1:i + 3])
+                tmp_wav = os.path.join(os.path.dirname(synced_path),
+                                       "_chunk_regen_tmp.wav")
+                self._tts_synth_segment_file(new_text, tmp_wav, params,
+                                             prev_text, next_text)
+                new_seg = _AudioSegment.from_file(tmp_wav)
+                spoken_ms = len(new_seg)
+
+                synced = _AudioSegment.from_file(synced_path)
+                # One-time backup of the untouched synced audio.
+                bak = os.path.splitext(synced_path)[0] + "_backup.wav"
+                if not os.path.exists(bak):
+                    shutil.copy2(synced_path, bak)
+
+                win_len = max(w1_ms - w0_ms, 1)
+                clipped = spoken_ms > win_len
+                if clipped:
+                    new_seg = new_seg[:win_len]
+                else:
+                    new_seg = new_seg + _AudioSegment.silent(
+                        duration=win_len - spoken_ms,
+                        frame_rate=new_seg.frame_rate)
+                combined = synced[:w0_ms] + new_seg + synced[w1_ms:]
+                combined.export(synced_path, format="wav")
+                try:
+                    os.remove(tmp_wav)
+                except Exception:
+                    pass
+
+                # Update the synced SRT: new text + new spoken duration.
+                try:
+                    with open(srt_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        srt_subs = _parse_srt_from_string(f.read())
+                    ordered = sorted(srt_subs.values(), key=lambda s: s.start)
+                    if i < len(ordered):
+                        sub = ordered[i]
+                        sub.text = new_text
+                        sub._dur = max(min(spoken_ms, win_len), 1)
+                        with open(srt_path, "w", encoding="utf-8") as f:
+                            f.write(_write_srt_from_dict(srt_subs))
+                except Exception:
+                    pass
+
+                if clipped:
+                    self._sf_log_append(
+                        f"[Compare] ⚠ chunk {i + 1}: new audio ({spoken_ms} ms) "
+                        f"longer than its window ({win_len} ms) — clipped so "
+                        "the timeline stays aligned")
+                self._sf_log_append(
+                    f"[Compare] ✔ chunk {i + 1} regenerated & merged → "
+                    f"{os.path.basename(synced_path)}")
+
+                def _done():
+                    self.status.config(
+                        text=f"Chunk {i + 1} regenerated → "
+                             f"{os.path.basename(synced_path)}")
+                    self._sf_cmp_load(keep_sel=i)
+                self.root.after(0, _done)
+            except Exception as exc:
+                err = str(exc)
+
+                def _fail(e=err):
+                    self._sf_cmp_info.config(text=f"Regenerate error: {e}")
+                    messagebox.showerror("Regenerate Chunk", e)
+                self.root.after(0, _fail)
+            finally:
+                self.root.after(0, lambda: self._sf_cmp_regen_btn.config(
+                    state="normal"))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _sf_cmp_play(self, side):
+        """Play a track from its playhead cursor (media-player style)."""
         d = self._sf_cmp_data.get(side)
         if not d:
             self._sf_cmp_info.config(text="Nothing loaded — hit ⟳ Reload.")
             return
+        cur = self._sf_cmp_cursor.get(side, 0.0)
+        if cur >= d["dur"] - 0.05:
+            cur = 0.0
         try:
             sd.stop()
-            sd.play(d["y"], samplerate=d["sr"])
-            self._sf_cmp_info.config(
-                text=f"Playing {'English' if side == 'en' else 'synced dub'} "
-                     f"({d['dur']:.1f}s)…")
+            sd.play(d["y"][int(cur * d["sr"]):], samplerate=d["sr"])
         except Exception as e:
             self._sf_cmp_info.config(text=f"Playback error: {e}")
+            return
+        self._sf_cmp_cursor[side]  = cur
+        self._sf_cmp_playing_side  = side
+        self._sf_cmp_play_from     = cur
+        self._sf_cmp_play_t0       = time.perf_counter()
+        self._sf_cmp_info.config(
+            text=f"Playing {'English' if side == 'en' else 'synced dub'} "
+                 f"from {self._sf_cmp_fmt(cur)} — click waveform to seek, "
+                 "■ Stop to pause")
+        self._sf_cmp_tick()
+
+    def _sf_cmp_tick(self):
+        side = self._sf_cmp_playing_side
+        if not side:
+            return
+        d = self._sf_cmp_data.get(side)
+        if not d:
+            self._sf_cmp_playing_side = None
+            return
+        pos = self._sf_cmp_play_from + (time.perf_counter()
+                                        - self._sf_cmp_play_t0)
+        if pos >= d["dur"]:
+            self._sf_cmp_playing_side = None
+            self._sf_cmp_cursor[side] = 0.0
+            self._sf_cmp_draw()
+            return
+        self._sf_cmp_cursor[side] = pos
+        # auto-follow the playhead when zoomed in
+        x0, x1, total = self._sf_cmp_view_window()
+        vis = x1 - x0
+        if pos > x1 and total > vis:
+            new_x0 = min(max(pos - vis * 0.1, 0.0), total - vis)
+            self._sf_cmp_scroll = new_x0 / (total - vis)
+        self._sf_cmp_draw()
+        self.root.after(150, self._sf_cmp_tick)
 
     def _sf_cmp_stop(self):
+        """Pause: the playhead keeps its position — ▶ resumes from there."""
+        side = self._sf_cmp_playing_side
+        if side:
+            pos = self._sf_cmp_play_from + (time.perf_counter()
+                                            - self._sf_cmp_play_t0)
+            d = self._sf_cmp_data.get(side)
+            if d:
+                self._sf_cmp_cursor[side] = min(pos, d["dur"])
+        self._sf_cmp_playing_side = None
         try:
             sd.stop()
         except Exception:
             pass
+        if self._sf_cmp_data:
+            self._sf_cmp_draw()
 
     # ── Batch Tab ─────────────────────────────────────────────────────────────
     def _build_batch_tab(self):
@@ -8317,7 +8741,7 @@ class EndToEndApp:
         canvas.draw()
 
         # Mouse-wheel: Ctrl held = zoom, no Ctrl = scroll
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>", "<Button-6>", "<Button-7>"):
             canvas.get_tk_widget().bind(
                 seq, lambda e, s=side: self._as_on_waveform_scroll(e, s))
 
@@ -8337,7 +8761,7 @@ class EndToEndApp:
                 lambda e, s=side: self._as_sb_on_drag(e, s))
         sb.bind("<ButtonRelease-1>",
                 lambda e, s=side: self._as_sb_on_release(e, s))
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>", "<Button-6>", "<Button-7>"):
             sb.bind(seq, lambda e, s=side: self._as_on_waveform_scroll(e, s))
         st["sb_canvas"] = sb
 
@@ -8499,7 +8923,9 @@ class EndToEndApp:
         if st["audio"] is None:
             return
         ctrl_held = bool(getattr(event, "state", 0) & 0x4)
-        up = (getattr(event, "delta", 0) > 0) or (getattr(event, "num", 0) == 4)
+        num   = getattr(event, "num", 0)
+        delta = getattr(event, "delta", 0)
+        up = (delta > 0) or (num in (4, 6))
         if ctrl_held:
             self._as_zoom_by_delta(5.0 if up else -5.0, side)
         else:
@@ -9758,8 +10184,28 @@ class EndToEndApp:
                 synced_subs, orig_te_subs, _sync_log = run_sync_from_strings(
                     en_srt, te_srt, mapping_text,
                     en_audio_duration=_en_audio_dur)
-                self.root.after(0, lambda n=len(synced_subs):
-                    self._set_stage("S3d", f"✔ {n} subtitles synced", "#22c55e"))
+                # Surface sync-quality info: force-fitted sections failed the
+                # normal fit rules and were anchored to their English start
+                # (possibly slightly pushed); dropped-from-mapping subs were
+                # kept at original timing. Both used to cause "unsynced" dubs.
+                _n_fit  = _sync_log.count("[force-fit]")
+                _n_kept = 1 if "missing from the" in _sync_log else 0
+                if _n_fit or _n_kept:
+                    self.root.after(0, lambda a=_n_fit:
+                        self._set_stage(
+                            "S3d",
+                            f"✔ synced — {a} section(s) force-fit to the "
+                            f"English timeline (see sync log)",
+                            "#f59e0b"))
+                    self._sf_log_append(
+                        f"[S3d] ⚠ {_n_fit} section(s) did not fit their slot "
+                        "and were anchored directly to their English start "
+                        "time. If a passage sounds crowded, shorten its "
+                        "translation and Re-Dub. Details: S3d sync log.")
+                else:
+                    self.root.after(0, lambda n=len(synced_subs):
+                        self._set_stage("S3d", f"✔ {n} subtitles synced",
+                                        "#22c55e"))
 
                 # Save sync log
                 with open(base + "_sync_log.txt", "w", encoding="utf-8") as _f:
@@ -10825,6 +11271,20 @@ class EndToEndApp:
     #  Waveform rendering
     # ─────────────────────────────────────────────────────────────────────────
     def _render_waveform(self):
+        """Coalesced render: momentum-scroll / playhead ticks can fire dozens
+        of times per second — schedule ONE draw on the idle loop instead of
+        rendering synchronously for every event (this froze scrolling and
+        made the whole app feel slow)."""
+        if getattr(self, "_render_pending", False):
+            return
+        self._render_pending = True
+        try:
+            self.root.after_idle(self._render_waveform_now)
+        except Exception:
+            self._render_pending = False
+
+    def _render_waveform_now(self):
+        self._render_pending = False
         if self.audio_data is None:
             return
         self.ax.clear()
@@ -10885,7 +11345,8 @@ class EndToEndApp:
         self.ax.set_title(f"{fname}  ·  {dur:.2f}s  ·  {sr} Hz",
                           color=TEXT, fontsize=9, pad=6, fontfamily="monospace")
         self.zoom_readout.config(text=f"{visible:.1f}s")
-        self.fig.tight_layout()
+        # NOTE: no tight_layout() here — it is very expensive and this runs
+        # on every scroll/zoom/playhead tick. Margins are set once at build.
         self.canvas.draw()
         self._sb_redraw()
 
@@ -10896,7 +11357,6 @@ class EndToEndApp:
                      color=TEXT_MUTED, fontsize=12, fontfamily="monospace")
         self.ax.set_xticks([]); self.ax.set_yticks([])
         for sp in self.ax.spines.values(): sp.set_edgecolor(GRID)
-        self.fig.tight_layout()
         self.canvas.draw()
 
     def _style_axes(self):
@@ -10978,7 +11438,9 @@ class EndToEndApp:
                         self.scroll_var.set(new_scroll)
             self._render_waveform()
         try:
-            self._playhead_after_id = self.root.after(33, self._playhead_tick)
+            # 10 fps is plenty for a moving cursor line and keeps the UI
+            # responsive (33 ms full-figure redraws made the app crawl).
+            self._playhead_after_id = self.root.after(100, self._playhead_tick)
         except tk.TclError:
             return
 
@@ -11006,7 +11468,11 @@ class EndToEndApp:
     def _on_waveform_scroll(self, event):
         if self.audio_data is None: return
         ctrl_held = bool(event.state & 0x4)
-        up = (getattr(event, "delta", 0) > 0) or (getattr(event, "num", 0) == 4)
+        num   = getattr(event, "num", 0)
+        delta = getattr(event, "delta", 0)
+        # Button-6/7 = X11 horizontal wheel; Shift+wheel = horizontal on
+        # macOS trackpads (two-finger swipe) and Windows mice.
+        up = (delta > 0) or (num in (4, 6))
         if ctrl_held: self._zoom_by_delta(5.0 if up else -5.0)
         else:         self._scroll_by(-0.05 if up else 0.05)
 
